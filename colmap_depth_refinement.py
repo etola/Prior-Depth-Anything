@@ -126,24 +126,13 @@ class ColmapDepthRefinement:
         self.dtype = dtype
         self.vggt = VGGT.from_pretrained("facebook/VGGT-1B").to(self.device)
         
-        print("Initializing Prior Depth Anything depth completion...")
-        from prior_depth_anything.depth_completion import DepthCompletion
-        from prior_depth_anything.utils import Arguments
+        print("Initializing Prior Depth Anything...")
+        from prior_depth_anything import PriorDepthAnything
         
-        # Create arguments for DepthCompletion
-        completion_args = Arguments()
-        completion_args.K = self.K
-        completion_args.frozen_model_size = "vitb"
-        completion_args.conditioned_model_size = "vitb"
-        completion_args.double_global = False
-        completion_args.normalize_depth = True
-        completion_args.normalize_confidence = True
-        
-        # Initialize depth completion model
-        self.depth_completion = DepthCompletion(
-            args=completion_args,
-            fmde_path=None,  # Will download automatically
-            device=str(self.device)
+        # Initialize PriorDepthAnything which handles model downloads automatically
+        self.prior_depth_anything = PriorDepthAnything(
+            device=str(self.device),
+            coarse_only=False  # We want both coarse and fine processing
         )
         
     def _load_colmap_reconstruction(self):
@@ -160,43 +149,46 @@ class ColmapDepthRefinement:
         
     def resize_and_scale_calibration(self, camera, original_size, target_size):
         """
-        Resize image and scale camera calibration accordingly.
+        Resize image and scale camera calibration using VGGT's exact logic.
         
         Args:
             camera: COLMAP camera object
             original_size: (width, height) of original image
-            target_size: target size for the larger dimension
+            target_size: target size (518) used by VGGT
             
         Returns:
-            new_size: (width, height) of resized image
-            scaled_K: (3, 3) scaled intrinsic matrix
+            new_size: (width, height) of resized image (matches VGGT)
+            scaled_K: (3, 3) scaled intrinsic matrix accounting for cropping
+            crop_offset_y: vertical offset due to center cropping (0 if no crop)
         """
         orig_w, orig_h = original_size
         
-        # Calculate new size maintaining aspect ratio
-        if orig_w > orig_h:
-            new_w = target_size
-            new_h = int(orig_h * target_size / orig_w)
-        else:
-            new_h = target_size  
-            new_w = int(orig_w * target_size / orig_h)
-            
-        # Ensure dimensions are multiples of 14 (for VGGT)
-        new_w = (new_w // 14) * 14
-        new_h = (new_h // 14) * 14
+        # Use VGGT's exact resizing logic from load_and_preprocess_images
+        # Step 1: Resize with width = target_size (518px)
+        new_w = target_size
+        # Calculate height maintaining aspect ratio, divisible by 14
+        resized_h = round(orig_h * (new_w / orig_w) / 14) * 14
         
-        # Scale intrinsic matrix
+        # Step 2: Center crop height if it's larger than target_size (VGGT behavior)
+        crop_offset_y = 0
+        if resized_h > target_size:
+            crop_offset_y = (resized_h - target_size) // 2
+            final_h = target_size
+        else:
+            final_h = resized_h
+        
+        # Scale intrinsic matrix accounting for resize and crop
         K = camera.calibration_matrix()
         scale_x = new_w / orig_w
-        scale_y = new_h / orig_h
+        scale_y = resized_h / orig_h  # Use the full resized height for scaling
         
         scaled_K = K.copy()
         scaled_K[0, 0] *= scale_x  # fx
         scaled_K[1, 1] *= scale_y  # fy  
         scaled_K[0, 2] *= scale_x  # cx
-        scaled_K[1, 2] *= scale_y  # cy
+        scaled_K[1, 2] = scaled_K[1, 2] * scale_y - crop_offset_y  # cy adjusted for crop
         
-        return (new_w, new_h), scaled_K
+        return (new_w, final_h), scaled_K, crop_offset_y
         
     def project_3d_points_to_depth_prior(self, points_3d, camera_pose, scaled_K, image_size):
         """
@@ -301,29 +293,30 @@ class ColmapDepthRefinement:
             print("Warning: No valid depth priors found, using VGGT depth only")
             return vggt_depth.numpy() if isinstance(vggt_depth, torch.Tensor) else vggt_depth
         
-        # Prepare tensors for DepthCompletion
-        # Convert to torch tensors and add batch dimension
-        image_tensor = torch.from_numpy(image).permute(2, 0, 1).unsqueeze(0).to(self.device)  # (1, 3, H, W)
-        vggt_depth_tensor = torch.from_numpy(vggt_depth if isinstance(vggt_depth, np.ndarray) else vggt_depth.numpy()).unsqueeze(0).to(self.device)  # (1, H, W)
-        depth_prior_tensor = torch.from_numpy(depth_prior).unsqueeze(0).to(self.device)  # (1, H, W)
-        prior_mask_tensor = torch.from_numpy(prior_mask).unsqueeze(0).to(self.device)  # (1, H, W)
+        # Prepare tensors for Prior Depth Anything
+        # Convert to torch tensors with consistent float32 dtype and add batch dimension
+        # Prepare tensors for Prior Depth Anything
+        image_tensor = torch.from_numpy(image.astype(np.float32)).permute(2, 0, 1).unsqueeze(0).to(self.device)
+        vggt_depth_np = vggt_depth if isinstance(vggt_depth, np.ndarray) else vggt_depth.numpy()
+        vggt_depth_tensor = torch.from_numpy(vggt_depth_np.astype(np.float32)).unsqueeze(0).to(self.device)
+        depth_prior_tensor = torch.from_numpy(depth_prior.astype(np.float32)).unsqueeze(0).to(self.device)
+        prior_mask_tensor = torch.from_numpy(prior_mask.astype(bool)).unsqueeze(0).to(self.device)
         
-        # Use DepthCompletion.forward with correct parameters:
+        # Use Prior Depth Anything's completion.forward with correct parameters:
         # - sparse_depths: COLMAP depth priors  
         # - sparse_masks: mask for COLMAP priors
         # - geometric_depths: VGGT depth estimate
         # - ret: 'knn' for KNN alignment
-        result = self.depth_completion.forward(
+        result = self.prior_depth_anything.completion.forward(
             images=image_tensor,
             sparse_depths=depth_prior_tensor,
             sparse_masks=prior_mask_tensor,
             geometric_depths=vggt_depth_tensor,
-            ret='knn'  # Use KNN alignment as requested
+            ret='knn'
         )
         
         # Extract refined depth and convert back to numpy
-        refined_depth = result.squeeze(0).cpu().numpy()
-        
+        refined_depth = result.squeeze(0).cpu().numpy().astype(np.float32)
         return refined_depth
         
     def generate_point_cloud(self, image, depth_map, scaled_K, camera_pose, image_id):
@@ -371,7 +364,15 @@ class ColmapDepthRefinement:
         cam_coords_homo = np.concatenate([cam_coords, np.ones((1, len(depth_valid)))], axis=0)
         
         # Transform to world coordinates
-        world_from_cam = np.linalg.inv(camera_pose)
+        # COLMAP's cam_from_world is typically 3x4 [R|t], need to make it 4x4 for inversion
+        if camera_pose.shape == (3, 4):
+            # Add bottom row [0, 0, 0, 1] to make it 4x4
+            bottom_row = np.array([[0, 0, 0, 1]])
+            camera_pose_4x4 = np.vstack([camera_pose, bottom_row])
+        else:
+            camera_pose_4x4 = camera_pose
+            
+        world_from_cam = np.linalg.inv(camera_pose_4x4)
         world_coords = (world_from_cam @ cam_coords_homo).T[:, :3]
         
         # Get corresponding colors
@@ -428,12 +429,23 @@ class ColmapDepthRefinement:
         camera_pose = self.reconstruction.get_image_cam_from_world(image_id).matrix()
         
         # Resize image and scale calibration
-        new_size, scaled_K = self.resize_and_scale_calibration(
+        new_size, scaled_K, crop_offset_y = self.resize_and_scale_calibration(
             camera, original_size, self.target_size
         )
         
-        # Resize image
-        image_resized = image_pil.resize(new_size, Image.BILINEAR)
+        # Resize image using VGGT's approach (resize then crop)
+        # First resize to full dimensions
+        orig_w, orig_h = original_size
+        resized_w = self.target_size
+        resized_h = round(orig_h * (resized_w / orig_w) / 14) * 14
+        
+        image_resized = image_pil.resize((resized_w, resized_h), Image.Resampling.BICUBIC)
+        
+        # Then center crop if needed (matching VGGT exactly)
+        if resized_h > self.target_size:
+            start_y = (resized_h - self.target_size) // 2
+            image_resized = image_resized.crop((0, start_y, resized_w, start_y + self.target_size))
+        
         image_array = np.array(image_resized)
         
         # Get filtered 3D points
@@ -445,10 +457,14 @@ class ColmapDepthRefinement:
             points_3d, camera_pose, scaled_K, new_size
         )
         
-        # Prepare image for VGGT
-        image_tensor = load_and_preprocess_images([str(image_path)]).to(self.device)
+        # Prepare image for VGGT using the same image we resized
+        # This ensures the VGGT output matches our depth prior dimensions
+        from torchvision import transforms as TF
+        to_tensor = TF.ToTensor()
+        image_tensor = to_tensor(image_resized).to(torch.float32).unsqueeze(0).to(self.device)  # (1, 3, H, W)
         
         # Estimate depth with VGGT  
+        # Run VGGT to get initial depth estimate
         vggt_depth, vggt_confidence = self.estimate_depth_with_vggt(image_tensor)
         
         # Refine depth using priors
@@ -456,7 +472,7 @@ class ColmapDepthRefinement:
             image_array, vggt_depth, vggt_confidence, depth_prior
         )
         
-        # Generate point cloud
+        # Generate point cloud using the same scaled_K that accounts for cropping
         points_3d_refined, colors = self.generate_point_cloud(
             image_array, refined_depth, scaled_K, camera_pose, image_id
         )
