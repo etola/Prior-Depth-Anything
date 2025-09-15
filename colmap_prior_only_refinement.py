@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-COLMAP-Based Depth Refinement Script
-===================================
+COLMAP Prior-Only Depth Completion Script
+=========================================
 
-This script processes COLMAP reconstructions to create depth priors for refining 
-VGGT depth estimates using Prior-Depth-Anything.
+This script processes COLMAP reconstructions to create depth completions using 
+ONLY COLMAP 3D points as priors (no VGGT geometric depths) with Prior-Depth-Anything.
 
 Usage:
-    python colmap_depth_refinement.py -s <scene_folder> -o <output_folder>
+    python colmap_prior_only_refinement.py -s <scene_folder> -o <output_folder>
 
 Where:
     - scene_folder/images contains input images
@@ -26,13 +26,7 @@ from tqdm import tqdm
 import open3d as o3d
 
 # Prior Depth Anything imports
-from prior_depth_anything.plugin import PriorDARefiner
-from prior_depth_anything.utils import depth2disparity, disparity2depth
-
-# VGGT imports
-from vggt.models.vggt import VGGT
-from vggt.utils.load_fn import load_and_preprocess_images
-from vggt.utils.geometry import unproject_depth_map_to_point_map
+from prior_depth_anything import PriorDepthAnything
 
 # COLMAP utilities
 from colmap_utils import ColmapReconstruction
@@ -41,7 +35,7 @@ from colmap_utils import ColmapReconstruction
 def parse_args():
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(
-        description="Refine VGGT depth estimates using COLMAP 3D points as priors"
+        description="Complete sparse COLMAP depth using Prior Depth Anything (no VGGT)"
     )
     parser.add_argument(
         "-s", "--scene_folder", 
@@ -73,24 +67,17 @@ def parse_args():
         default="cuda" if torch.cuda.is_available() else "cpu",
         help="Device to use for computation"
     )
-    parser.add_argument(
-        "--K", 
-        type=int, 
-        default=5,
-        help="K parameter for KNN alignment in depth completion (default: 5)"
-    )
     
     return parser.parse_args()
 
 
-class ColmapDepthRefinement:
-    """Main class for COLMAP-based depth refinement pipeline."""
+class ColmapPriorOnlyRefinement:
+    """Main class for COLMAP prior-only depth completion pipeline."""
     
     def __init__(self, args):
         self.args = args
         self.device = torch.device(args.device)
         self.target_size = args.target_size
-        self.K = getattr(args, 'K', 5)  # KNN parameter for depth completion
         
         # Initialize scene paths
         self.scene_folder = Path(args.scene_folder)
@@ -104,8 +91,8 @@ class ColmapDepthRefinement:
         # Create output directory
         self.output_folder.mkdir(exist_ok=True, parents=True)
         
-        # Initialize models
-        self._init_models()
+        # Initialize Prior Depth Anything model
+        self._init_model()
         
         # Load COLMAP reconstruction
         self._load_colmap_reconstruction()
@@ -119,15 +106,9 @@ class ColmapDepthRefinement:
         if not self.sparse_folder.exists():
             raise FileNotFoundError(f"Sparse folder not found: {self.sparse_folder}")
             
-    def _init_models(self):
-        """Initialize VGGT and Prior Depth Anything models."""
-        print("Initializing VGGT model...")
-        dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
-        self.dtype = dtype
-        self.vggt = VGGT.from_pretrained("facebook/VGGT-1B").to(self.device)
-        
+    def _init_model(self):
+        """Initialize Prior Depth Anything model."""
         print("Initializing Prior Depth Anything...")
-        from prior_depth_anything import PriorDepthAnything
         
         # Initialize PriorDepthAnything which handles model downloads automatically
         self.prior_depth_anything = PriorDepthAnything(
@@ -149,27 +130,26 @@ class ColmapDepthRefinement:
         
     def resize_and_scale_calibration(self, camera, original_size, target_size):
         """
-        Resize image and scale camera calibration using VGGT's exact logic.
+        Resize image and scale camera calibration.
         
         Args:
             camera: COLMAP camera object
             original_size: (width, height) of original image
-            target_size: target size (518) used by VGGT
+            target_size: target size (518) 
             
         Returns:
-            new_size: (width, height) of resized image (matches VGGT)
+            new_size: (width, height) of resized image
             scaled_K: (3, 3) scaled intrinsic matrix accounting for cropping
             crop_offset_y: vertical offset due to center cropping (0 if no crop)
         """
         orig_w, orig_h = original_size
         
-        # Use VGGT's exact resizing logic from load_and_preprocess_images
-        # Step 1: Resize with width = target_size (518px)
+        # Simple resize maintaining aspect ratio, make width = target_size
         new_w = target_size
         # Calculate height maintaining aspect ratio, divisible by 14
         resized_h = round(orig_h * (new_w / orig_w) / 14) * 14
         
-        # Step 2: Center crop height if it's larger than target_size (VGGT behavior)
+        # Center crop height if it's larger than target_size
         crop_offset_y = 0
         if resized_h > target_size:
             crop_offset_y = (resized_h - target_size) // 2
@@ -253,79 +233,65 @@ class ColmapDepthRefinement:
                 
         return depth_prior, sparse_mask
         
-    def estimate_depth_with_vggt(self, image_tensor):
+    def complete_depth_with_prior_only(self, image, depth_prior, sparse_mask):
         """
-        Estimate depth using VGGT model.
-        
-        Args:
-            image_tensor: (1, 3, H, W) preprocessed image tensor
-            
-        Returns:
-            depth_map: (H, W) estimated depth map  
-            confidence: (H, W) confidence map
-        """
-        with torch.no_grad():
-            with torch.cuda.amp.autocast(dtype=self.dtype):
-                predictions = self.vggt(image_tensor)
-                
-        depth_map = predictions['depth'].squeeze().cpu()
-        confidence = predictions['depth_conf'].squeeze().cpu()
-        
-        return depth_map, confidence
-        
-    def refine_depth_with_prior(self, image, vggt_depth, vggt_confidence, depth_prior):
-        """
-        Refine VGGT depth using Prior Depth Anything with 3D point priors.
+        Complete depth using Prior Depth Anything with ONLY COLMAP priors (no geometric depths).
         
         Args:
             image: (H, W, 3) uint8 image
-            vggt_depth: (H, W) VGGT depth estimate
-            vggt_confidence: (H, W) VGGT confidence 
             depth_prior: (H, W) depth prior from 3D points
+            sparse_mask: (H, W) mask indicating valid prior depths
             
         Returns:
-            refined_depth: (H, W) refined depth map
+            completed_depth: (H, W) completed depth map
         """
-        # Convert depth prior to create sparse depth for refinement
-        prior_mask = depth_prior > 0
+        print(f"DEBUG: Input shapes - image: {image.shape}, depth_prior: {depth_prior.shape}, sparse_mask: {sparse_mask.shape}")
         
-        if not np.any(prior_mask):
-            print("Warning: No valid depth priors found, using VGGT depth only")
-            return vggt_depth.numpy() if isinstance(vggt_depth, torch.Tensor) else vggt_depth
+        if not np.any(sparse_mask):
+            print("Warning: No valid depth priors found, cannot complete")
+            return np.zeros_like(depth_prior)
+        
+        print(f"DEBUG: Found {np.sum(sparse_mask)} valid sparse points")
         
         # Prepare tensors for Prior Depth Anything
-        # Convert to torch tensors with consistent float32 dtype and add batch dimension
-        # Prepare tensors for Prior Depth Anything
-        image_tensor = torch.from_numpy(image.astype(np.float32)).permute(2, 0, 1).unsqueeze(0).to(self.device)
-        vggt_depth_np = vggt_depth if isinstance(vggt_depth, np.ndarray) else vggt_depth.numpy()
-        vggt_depth_tensor = torch.from_numpy(vggt_depth_np.astype(np.float32)).unsqueeze(0).to(self.device)
+        image_tensor = torch.from_numpy(image.astype(np.uint8)).permute(2, 0, 1).unsqueeze(0).to(self.device)  # Use uint8 for image
         depth_prior_tensor = torch.from_numpy(depth_prior.astype(np.float32)).unsqueeze(0).to(self.device)
-        prior_mask_tensor = torch.from_numpy(prior_mask.astype(bool)).unsqueeze(0).to(self.device)
+        sparse_mask_tensor = torch.from_numpy(sparse_mask.astype(bool)).unsqueeze(0).unsqueeze(1).to(self.device)  # Add channel dimension
         
-        # Use Prior Depth Anything's completion.forward with correct parameters:
-        # - sparse_depths: COLMAP depth priors  
-        # - sparse_masks: mask for COLMAP priors
-        # - geometric_depths: VGGT depth estimate
-        # - ret: 'knn' for KNN alignment
-        result = self.prior_depth_anything.completion.forward(
-            images=image_tensor,
-            sparse_depths=depth_prior_tensor,
-            sparse_masks=prior_mask_tensor,
-            geometric_depths=vggt_depth_tensor,
-            ret='knn'
-        )
+        print(f"DEBUG: Tensor shapes - image_tensor: {image_tensor.shape}, depth_prior_tensor: {depth_prior_tensor.shape}, sparse_mask_tensor: {sparse_mask_tensor.shape}")
         
-        # Extract refined depth and convert back to numpy
-        refined_depth = result.squeeze(0).cpu().numpy().astype(np.float32)
-        return refined_depth
+        try:
+            print("DEBUG: Calling Prior Depth Anything...")
+            # Use Prior Depth Anything for depth completion WITHOUT geometric depths
+            # This will use the coarse depth estimator for initial prediction, then refine with priors
+            result = self.prior_depth_anything(
+                images=image_tensor,
+                sparse_depths=depth_prior_tensor,
+                sparse_masks=sparse_mask_tensor,
+                # No geometric_depths parameter - Prior Depth Anything will use its own coarse estimator
+            )
+            print(f"DEBUG: Prior Depth Anything result shape: {result.shape}")
+            
+        except Exception as e:
+            print(f"ERROR in Prior Depth Anything call: {e}")
+            print(f"ERROR: Input tensor shapes were:")
+            print(f"  - images: {image_tensor.shape}")
+            print(f"  - sparse_depths: {depth_prior_tensor.shape}")
+            print(f"  - sparse_masks: {sparse_mask_tensor.shape}")
+            raise e
+        
+        # Extract completed depth and convert back to numpy
+        completed_depth = result.squeeze().detach().cpu().numpy().astype(np.float32)  # Squeeze all single dimensions
+        print(f"DEBUG: Final completed depth shape: {completed_depth.shape}")
+        return completed_depth
         
     def generate_point_cloud(self, image, depth_map, scaled_K, camera_pose, image_id):
         """
-        Generate point cloud from refined depth map.
+        Generate point cloud from completed depth map.
         
         Args:
             image: (H, W, 3) image array
-            depth_map: (H, W) refined depth map
+            depth_map: (H, W) completed depth map
             scaled_K: (3, 3) scaled intrinsic matrix
             camera_pose: (4, 4) camera pose matrix
             image_id: COLMAP image ID for naming
@@ -364,7 +330,6 @@ class ColmapDepthRefinement:
         cam_coords_homo = np.concatenate([cam_coords, np.ones((1, len(depth_valid)))], axis=0)
         
         # Transform to world coordinates
-        # COLMAP's cam_from_world is typically 3x4 [R|t], need to make it 4x4 for inversion
         if camera_pose.shape == (3, 4):
             # Add bottom row [0, 0, 0, 1] to make it 4x4
             bottom_row = np.array([[0, 0, 0, 1]])
@@ -406,16 +371,6 @@ class ColmapDepthRefinement:
     def colorize_and_save_prior_points(self, points_3d, image_array, scaled_K, camera_pose, image_name):
         """
         Colorize COLMAP 3D points with image colors and save as point cloud.
-        
-        Args:
-            points_3d: (N, 3) world coordinates of COLMAP 3D points
-            image_array: (H, W, 3) image array 
-            scaled_K: (3, 3) scaled intrinsic matrix
-            camera_pose: (4, 4) camera pose matrix
-            image_name: name of the image for output filename
-            
-        Returns:
-            None (saves PLY file)
         """
         if len(points_3d) == 0:
             print(f"Warning: No prior points to save for {image_name}")
@@ -464,144 +419,6 @@ class ColmapDepthRefinement:
         prior_filename = f"prior-{Path(image_name).stem}.ply"
         prior_output_path = self.output_folder / prior_filename
         self.save_point_cloud(points_3d_final, colors, prior_output_path)
-    
-    def save_vggt_point_cloud(self, image_array, vggt_depth, scaled_K, camera_pose, image_name):
-        """
-        Generate and save VGGT point cloud before refinement.
-        
-        Args:
-            image_array: (H, W, 3) image array
-            vggt_depth: (H, W) VGGT depth estimate (tensor or numpy array)
-            scaled_K: (3, 3) scaled intrinsic matrix
-            camera_pose: (4, 4) camera pose matrix  
-            image_name: name of the image for output filename
-            
-        Returns:
-            None (saves PLY file)
-        """
-        # Convert VGGT depth to numpy if it's a tensor
-        if isinstance(vggt_depth, torch.Tensor):
-            vggt_depth_np = vggt_depth.cpu().numpy()
-        else:
-            vggt_depth_np = vggt_depth
-            
-        # Generate point cloud from VGGT depth
-        points_3d_vggt, colors_vggt = self.generate_point_cloud(
-            image_array, vggt_depth_np, scaled_K, camera_pose, image_name
-        )
-        
-        if len(points_3d_vggt) == 0:
-            print(f"Warning: No VGGT points generated for {image_name}")
-            return
-        
-        # Save VGGT point cloud
-        vggt_filename = f"vggt-{Path(image_name).stem}.ply"
-        vggt_output_path = self.output_folder / vggt_filename
-        self.save_point_cloud(points_3d_vggt, colors_vggt, vggt_output_path)
-    
-    def save_depth_prior_point_cloud(self, image_array, depth_prior, sparse_mask, scaled_K, camera_pose, image_name):
-        """
-        Generate and save point cloud from depth_prior to verify projection/back-projection.
-        
-        Args:
-            image_array: (H, W, 3) image array
-            depth_prior: (H, W) depth prior from projected COLMAP points
-            sparse_mask: (H, W) mask indicating valid depth points
-            scaled_K: (3, 3) scaled intrinsic matrix
-            camera_pose: (4, 4) camera pose matrix
-            image_name: name of the image for output filename
-            
-        Returns:
-            None (saves PLY file)
-        """
-        if not np.any(sparse_mask):
-            print(f"Warning: No depth prior points for {image_name}")
-            return
-            
-        # Create a masked depth map with only valid prior depths
-        masked_depth_prior = np.where(sparse_mask, depth_prior, 0)
-        
-        # Generate point cloud from depth prior using the same method as other point clouds
-        points_3d_depth_prior, colors_depth_prior = self.generate_point_cloud(
-            image_array, masked_depth_prior, scaled_K, camera_pose, image_name
-        )
-        
-        if len(points_3d_depth_prior) == 0:
-            print(f"Warning: No depth prior points generated for {image_name}")
-            return
-        
-        # Save depth prior point cloud
-        depth_prior_filename = f"depth_prior-{Path(image_name).stem}.ply"
-        depth_prior_output_path = self.output_folder / depth_prior_filename
-        self.save_point_cloud(points_3d_depth_prior, colors_depth_prior, depth_prior_output_path)
-    
-    def compute_prior_scaled_depth(self, image_array, sparse_depths, geometric_depths, sparse_masks):
-        """
-        Compute KNN-scaled depth map using the depth completion pipeline.
-        This uses the actual depth completion KNN method for accurate scaling.
-        
-        Args:
-            image_array: (H, W, 3) image array
-            sparse_depths: (H, W) depth prior from COLMAP points
-            geometric_depths: (H, W) VGGT depth estimate  
-            sparse_masks: (H, W) mask indicating valid prior depths
-            
-        Returns:
-            scaled_depth: (H, W) KNN-scaled geometric depth aligned to sparse depths
-        """
-        # Prepare tensors for depth completion (same format as the pipeline)
-        image_tensor = torch.from_numpy(image_array.astype(np.float32)).permute(2, 0, 1).unsqueeze(0).to(self.device)
-        sparse_depths_tensor = torch.from_numpy(sparse_depths.astype(np.float32)).unsqueeze(0).to(self.device)
-        geometric_depths_tensor = torch.from_numpy(geometric_depths.astype(np.float32)).unsqueeze(0).to(self.device)
-        sparse_masks_tensor = torch.from_numpy(sparse_masks.astype(bool)).unsqueeze(0).to(self.device)
-        
-        # Use depth completion's KNN method directly (ret='knn' gives just KNN scaling)
-        try:
-            knn_result = self.prior_depth_anything.completion.forward(
-                images=image_tensor,
-                sparse_depths=sparse_depths_tensor,
-                sparse_masks=sparse_masks_tensor,
-                geometric_depths=geometric_depths_tensor,
-                ret='knn'  # Only return KNN-scaled result
-            )
-            
-            # Extract and convert back to numpy
-            scaled_depth = knn_result.squeeze(0).cpu().numpy().astype(np.float32)
-            return scaled_depth
-            
-        except Exception as e:
-            print(f"Warning: KNN scaling failed: {e}, using geometric depth")
-            return geometric_depths
-    
-    def save_prior_scaled_point_cloud(self, image_array, sparse_depths, geometric_depths, sparse_masks, scaled_K, camera_pose, image_name):
-        """
-        Generate and save point cloud from prior-scaled depth to verify registration.
-        
-        Args:
-            image_array: (H, W, 3) image array
-            sparse_depths: (H, W) depth prior from COLMAP points
-            geometric_depths: (H, W) VGGT depth estimate
-            sparse_masks: (H, W) mask indicating valid prior depths
-            scaled_K: (3, 3) scaled intrinsic matrix
-            camera_pose: (4, 4) camera pose matrix
-            image_name: name of the image for output filename
-        """
-        # Compute scaled depth using depth completion's KNN method
-        scaled_depth = self.compute_prior_scaled_depth(image_array, sparse_depths, geometric_depths, sparse_masks)
-        
-        # Generate point cloud from scaled depth
-        points_3d_scaled, colors_scaled = self.generate_point_cloud(
-            image_array, scaled_depth, scaled_K, camera_pose, image_name
-        )
-        
-        if len(points_3d_scaled) == 0:
-            print(f"Warning: No scaled points generated for {image_name}")
-            return
-        
-        # Save prior-scaled point cloud
-        scaled_filename = f"prior_knn_scaled-{Path(image_name).stem}.ply"
-        scaled_output_path = self.output_folder / scaled_filename
-        self.save_point_cloud(points_3d_scaled, colors_scaled, scaled_output_path)
         
     def process_frame(self, image_id):
         """
@@ -633,20 +450,24 @@ class ColmapDepthRefinement:
             camera, original_size, self.target_size
         )
         
-        # Resize image using VGGT's approach (resize then crop)
-        # First resize to full dimensions
+        # Resize image
         orig_w, orig_h = original_size
         resized_w = self.target_size
         resized_h = round(orig_h * (resized_w / orig_w) / 14) * 14
         
+        print(f"DEBUG: Original size: {original_size}, Resized dimensions: {resized_w}x{resized_h}")
+        
         image_resized = image_pil.resize((resized_w, resized_h), Image.Resampling.BICUBIC)
         
-        # Then center crop if needed (matching VGGT exactly)
+        # Center crop if needed
         if resized_h > self.target_size:
             start_y = (resized_h - self.target_size) // 2
             image_resized = image_resized.crop((0, start_y, resized_w, start_y + self.target_size))
+            print(f"DEBUG: Applied center crop from y={start_y} to y={start_y + self.target_size}")
         
         image_array = np.array(image_resized)
+        print(f"DEBUG: Final image array shape: {image_array.shape}")
+        print(f"DEBUG: New size from calibration: {new_size}")
         
         # Get filtered 3D points
         points_3d, points_2d, point_ids = self.reconstruction.get_visible_3d_points(image_id, self.args.min_track_length)
@@ -660,56 +481,38 @@ class ColmapDepthRefinement:
             points_3d, camera_pose, scaled_K, new_size
         )
         
-        # Save depth prior point cloud to verify projection/back-projection
-        self.save_depth_prior_point_cloud(image_array, depth_prior, sparse_mask, scaled_K, camera_pose, image_name)
+        print(f"DEBUG: After projection - depth_prior shape: {depth_prior.shape}, sparse_mask shape: {sparse_mask.shape}")
+        print(f"Depth prior has {np.sum(sparse_mask)} valid pixels")
+        print(f"DEBUG: Image array shape before completion: {image_array.shape}")
         
-        # Prepare image for VGGT using the same image we resized
-        # This ensures the VGGT output matches our depth prior dimensions
-        from torchvision import transforms as TF
-        to_tensor = TF.ToTensor()
-        image_tensor = to_tensor(image_resized).to(torch.float32).unsqueeze(0).to(self.device)  # (1, 3, H, W)
-        
-        # Estimate depth with VGGT  
-        # Run VGGT to get initial depth estimate
-        vggt_depth, vggt_confidence = self.estimate_depth_with_vggt(image_tensor)
-        
-        # Save VGGT point cloud before refinement
-        self.save_vggt_point_cloud(image_array, vggt_depth, scaled_K, camera_pose, image_name)
-        
-        # Convert VGGT depth to numpy for scaling computation
-        vggt_depth_np = vggt_depth.cpu().numpy() if isinstance(vggt_depth, torch.Tensor) else vggt_depth
-        
-        # Save prior-scaled point cloud to verify intermediate KNN scaling step
-        self.save_prior_scaled_point_cloud(image_array, depth_prior, vggt_depth_np, sparse_mask, scaled_K, camera_pose, image_name)
-        
-        # Refine depth using priors
-        refined_depth = self.refine_depth_with_prior(
-            image_array, vggt_depth, vggt_confidence, depth_prior
+        # Complete depth using only COLMAP priors
+        completed_depth = self.complete_depth_with_prior_only(
+            image_array, depth_prior, sparse_mask
         )
         
-        # Generate point cloud using the same scaled_K that accounts for cropping
-        points_3d_refined, colors = self.generate_point_cloud(
-            image_array, refined_depth, scaled_K, camera_pose, image_id
+        # Generate point cloud from completed depth
+        points_3d_completed, colors = self.generate_point_cloud(
+            image_array, completed_depth, scaled_K, camera_pose, image_id
         )
         
-        # Save point cloud
-        output_filename = f"frame_{image_id:06d}_{Path(image_name).stem}.ply"
+        # Save completed point cloud
+        output_filename = f"completed_{image_id:06d}_{Path(image_name).stem}.ply"
         output_path = self.output_folder / output_filename
-        self.save_point_cloud(points_3d_refined, colors, output_path)
+        self.save_point_cloud(points_3d_completed, colors, output_path)
         
     def run(self):
         """Run the complete pipeline on all frames in the reconstruction."""
         print(f"Processing {self.reconstruction.get_num_images()} images...")
         
         image_ids = self.reconstruction.get_all_image_ids()
-
+        
         counter = 0        
         for image_id in tqdm(image_ids, desc="Processing frames"):
             self.process_frame(image_id)
-
-            counter += 1
-            if counter > 10:
-                break
+                
+            # counter += 1
+            # if counter > 0:
+            #     break
                 
         print(f"\nProcessing complete! Point clouds saved to: {self.output_folder}")
 
@@ -719,7 +522,7 @@ def main():
     args = parse_args()
     
     # Create and run the refinement pipeline
-    pipeline = ColmapDepthRefinement(args)
+    pipeline = ColmapPriorOnlyRefinement(args)
     pipeline.run()
 
 
