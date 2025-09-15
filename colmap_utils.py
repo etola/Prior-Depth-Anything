@@ -357,6 +357,113 @@ class ColmapReconstruction:
         ])
         
         return dist_dict, dist_coeffs
+    
+    def get_visible_3d_points(self, image_id: int, min_track_length: int = 0) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """
+        Get 3D points visible in the specified image with optional track length filtering.
+        
+        Args:
+            image_id: COLMAP image ID
+            min_track_length: Minimum track length for 3D points (default: 0, no filtering)
+            
+        Returns:
+            points_3d: (N, 3) array of 3D world coordinates
+            points_2d: (N, 2) array of 2D image coordinates  
+            point_ids: (N,) array of 3D point IDs
+        """
+        if not self.has_image(image_id):
+            raise KeyError(f"Image ID {image_id} not found in reconstruction")
+        
+        # Ensure mappings are built
+        self._ensure_image_point_maps()
+        
+        # Check if image has any 3D points
+        if image_id not in self._image_point3D_ids:
+            return np.array([]).reshape(0, 3), np.array([]).reshape(0, 2), np.array([])
+        
+        # Get all 3D point IDs visible in this image
+        visible_point_ids = self._image_point3D_ids[image_id]
+        
+        if not visible_point_ids:
+            return np.array([]).reshape(0, 3), np.array([]).reshape(0, 2), np.array([])
+        
+        # Filter by track length if specified
+        if min_track_length > 0:
+            filtered_point_ids = []
+            for point_id in visible_point_ids:
+                point3d = self.reconstruction.points3D[point_id]
+                if len(point3d.track.elements) >= min_track_length:
+                    filtered_point_ids.append(point_id)
+            visible_point_ids = filtered_point_ids
+        
+        if not visible_point_ids:
+            return np.array([]).reshape(0, 3), np.array([]).reshape(0, 2), np.array([])
+        
+        # Extract 3D coordinates, 2D projections, and point IDs
+        points_3d = []
+        points_2d = []
+        point_ids = []
+        
+        for point_id in visible_point_ids:
+            point3d = self.reconstruction.points3D[point_id]
+            point2d_xy = self._image_point3D_xy[image_id][point_id]
+            
+            points_3d.append(point3d.xyz)
+            points_2d.append(point2d_xy)
+            point_ids.append(point_id)
+        
+        return np.array(points_3d), np.array(points_2d), np.array(point_ids)
+    
+    def get_3d_points_stats(self, image_id: int, min_track_length: int = 0) -> Dict:
+        """
+        Get statistics about 3D points visible in an image.
+        
+        Args:
+            image_id: COLMAP image ID
+            min_track_length: Minimum track length for filtering
+            
+        Returns:
+            Dictionary with statistics about visible 3D points
+        """
+        points_3d, points_2d, point_ids = self.get_visible_3d_points(image_id, min_track_length)
+        
+        if len(points_3d) == 0:
+            return {
+                'num_points': 0,
+                'track_lengths': [],
+                'avg_track_length': 0,
+                'min_track_length': 0,
+                'max_track_length': 0,
+                'coverage_x': 0.0,
+                'coverage_y': 0.0
+            }
+        
+        # Compute track length statistics
+        track_lengths = []
+        for point_id in point_ids:
+            point3d = self.reconstruction.points3D[point_id]
+            track_lengths.append(len(point3d.track.elements))
+        
+        # Compute spatial coverage
+        camera = self.get_image_camera(image_id)
+        x_coords = points_2d[:, 0]
+        y_coords = points_2d[:, 1]
+        
+        x_range = (x_coords.max() - x_coords.min()) if len(x_coords) > 1 else 0
+        y_range = (y_coords.max() - y_coords.min()) if len(y_coords) > 1 else 0
+        
+        coverage_x = x_range / camera.width
+        coverage_y = y_range / camera.height
+        
+        return {
+            'num_points': len(points_3d),
+            'track_lengths': track_lengths,
+            'avg_track_length': np.mean(track_lengths),
+            'min_track_length': min(track_lengths),
+            'max_track_length': max(track_lengths),
+            'coverage_x': coverage_x,
+            'coverage_y': coverage_y
+        }
 
 
 
