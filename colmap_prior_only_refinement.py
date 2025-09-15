@@ -7,12 +7,13 @@ This script processes COLMAP reconstructions to create depth completions using
 ONLY COLMAP 3D points as priors (no VGGT geometric depths) with Prior-Depth-Anything.
 
 Usage:
-    python colmap_prior_only_refinement.py -s <scene_folder> -o <output_folder>
+    python colmap_prior_only_refinement.py -s <scene_folder> -o <output_folder> [--prior_extra <extra_reconstruction_path>]
 
 Where:
     - scene_folder/images contains input images
     - scene_folder/sparse contains COLMAP reconstruction
     - Output point clouds are saved to scene_folder/output_folder/
+    - --prior_extra (optional): Path to extra COLMAP reconstruction to augment 3D points (must have same images and camera calibrations)
 """
 
 import os
@@ -67,6 +68,12 @@ def parse_args():
         default="cuda" if torch.cuda.is_available() else "cpu",
         help="Device to use for computation"
     )
+    parser.add_argument(
+        "--prior_extra", 
+        type=str, 
+        default=None,
+        help="Optional path to extra COLMAP reconstruction to augment 3D points (must have same images and camera calibrations as main reconstruction)"
+    )
     
     return parser.parse_args()
 
@@ -96,6 +103,11 @@ class ColmapPriorOnlyRefinement:
         
         # Load COLMAP reconstruction
         self._load_colmap_reconstruction()
+        
+        # Load extra COLMAP reconstruction if provided
+        self.extra_reconstruction = None
+        if args.prior_extra:
+            self._load_extra_colmap_reconstruction()
         
     def _validate_paths(self):
         """Validate that required input paths exist."""
@@ -127,6 +139,23 @@ class ColmapPriorOnlyRefinement:
         print("Building image-to-3D point mappings...")
         self.reconstruction._ensure_image_point_maps()
         print("3D point mappings ready!")
+        
+    def _load_extra_colmap_reconstruction(self):
+        """Load extra COLMAP reconstruction for augmenting 3D points."""
+        extra_path = Path(self.args.prior_extra)
+        if not extra_path.exists():
+            raise FileNotFoundError(f"Extra reconstruction path not found: {extra_path}")
+            
+        print(f"Loading extra COLMAP reconstruction from {extra_path}")
+        self.extra_reconstruction = ColmapReconstruction(str(extra_path))
+        summary = self.extra_reconstruction.get_summary()
+        print(f"Loaded extra reconstruction: {summary}")
+        
+        # Build image-to-point mappings for efficiency
+        print("Building extra reconstruction image-to-3D point mappings...")
+        self.extra_reconstruction._ensure_image_point_maps()
+        print("Extra reconstruction 3D point mappings ready!")
+        
         
     def resize_and_scale_calibration(self, camera, original_size, target_size):
         """
@@ -469,9 +498,27 @@ class ColmapPriorOnlyRefinement:
         print(f"DEBUG: Final image array shape: {image_array.shape}")
         print(f"DEBUG: New size from calibration: {new_size}")
         
-        # Get filtered 3D points
+        # Get filtered 3D points from main reconstruction
         points_3d, points_2d, point_ids = self.reconstruction.get_visible_3d_points(image_id, self.args.min_track_length)
-        print(f"Found {len(points_3d)} 3D points with track length >= {self.args.min_track_length}")
+        print(f"Found {len(points_3d)} 3D points from main reconstruction with track length >= {self.args.min_track_length}")
+        
+        # Augment with points from extra reconstruction if available
+        # Since images and camera calibrations are exactly the same, we can use the same image_id
+        if self.extra_reconstruction is not None:
+            if self.extra_reconstruction.has_image(image_id):
+                extra_points_3d, extra_points_2d, extra_point_ids = self.extra_reconstruction.get_visible_3d_points(
+                    image_id, self.args.min_track_length
+                )
+                print(f"Found {len(extra_points_3d)} additional 3D points from extra reconstruction")
+                
+                # Combine points from both reconstructions
+                if len(extra_points_3d) > 0:
+                    points_3d = np.vstack([points_3d, extra_points_3d])
+                    points_2d = np.vstack([points_2d, extra_points_2d])
+                    point_ids = np.concatenate([point_ids, extra_point_ids])
+                    print(f"Total augmented points: {len(points_3d)}")
+            else:
+                print(f"Warning: Image ID {image_id} not found in extra reconstruction")
         
         # Save colorized prior point cloud
         self.colorize_and_save_prior_points(points_3d, image_array, scaled_K, camera_pose, image_name)
