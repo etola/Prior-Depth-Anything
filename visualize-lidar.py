@@ -78,6 +78,9 @@ class LidarPointCloudGenerator:
         # Find matching image-lidar pairs
         self._find_matching_pairs()
         
+        # Compute global scale factor
+        self.global_scale = self._compute_global_scale_factor()
+        
     def _validate_paths(self):
         """Validate that required input paths exist."""
         if not self.scene_folder.exists():
@@ -161,6 +164,145 @@ class LidarPointCloudGenerator:
         
         if len(self.matching_pairs) == 0:
             raise ValueError("No matching image-LiDAR pairs found. Check your file naming convention.")
+    
+    def _compute_global_scale_factor(self):
+        """
+        Compute global scale factor by analyzing scale distribution across all cameras.
+        Uses middle 20% of scales to remove outliers' influence.
+        
+        Returns:
+            global_scale: Single scale factor to apply to entire scene
+        """
+        print("\nComputing global scale factor from all cameras...")
+        all_scales = []
+        
+        for pair in tqdm(self.matching_pairs, desc="Analyzing scales"):
+            try:
+                # Load LiDAR data
+                depth_map, confidence_map = self.load_lidar_data(
+                    pair['depth_path'], pair['confidence_path']
+                )
+                
+                # Get point-wise scales for this camera
+                scales = self._compute_pointwise_scales(
+                    depth_map, confidence_map, pair['image_id']
+                )
+                
+                if len(scales) > 0:
+                    all_scales.extend(scales)
+                    print(f"  {pair['image_name']}: {len(scales)} valid scales")
+                else:
+                    print(f"  {pair['image_name']}: No valid scales found")
+                    
+            except Exception as e:
+                print(f"  Error processing {pair['image_name']}: {e}")
+                continue
+        
+        if len(all_scales) == 0:
+            print("Warning: No valid scales found across all cameras, using default scale of 1.0")
+            return 1.0
+        
+        # Sort all scales
+        all_scales = np.array(all_scales)
+        sorted_scales = np.sort(all_scales)
+        
+        print(f"Total scales collected: {len(sorted_scales)}")
+        print(f"Scale range: {sorted_scales[0]:.3f} to {sorted_scales[-1]:.3f}")
+        print(f"Scale median: {np.median(sorted_scales):.3f}")
+        
+        # Select middle 20% to remove outliers
+        n_scales = len(sorted_scales)
+        lower_bound = int(0.4 * n_scales)  # Start of middle 20%
+        upper_bound = int(0.6 * n_scales)  # End of middle 20%
+        
+        if upper_bound <= lower_bound:
+            # If too few scales, use all of them
+            middle_scales = sorted_scales
+            print(f"Too few scales ({n_scales}), using all scales")
+        else:
+            middle_scales = sorted_scales[lower_bound:upper_bound]
+            print(f"Using middle 20%: {len(middle_scales)} scales from index {lower_bound} to {upper_bound}")
+        
+        # Compute average of middle 20%
+        global_scale = np.mean(middle_scales)
+        
+        print(f"Middle 20% range: {middle_scales[0]:.3f} to {middle_scales[-1]:.3f}")
+        print(f"Computed global scale: {global_scale:.3f}")
+        
+        return float(global_scale)
+    
+    def _compute_pointwise_scales(self, depth_map, confidence_map, image_id):
+        """
+        Compute point-wise scales between COLMAP depths and LiDAR depths for a single camera.
+        
+        Args:
+            depth_map: (H, W) LiDAR depth map
+            confidence_map: (H, W) confidence map
+            image_id: COLMAP image ID
+            
+        Returns:
+            scales: List of scale values for points with non-zero confidence
+        """
+        # Get camera information
+        camera = self.reconstruction.get_image_camera(image_id)
+        K = camera.calibration_matrix()
+        camera_pose = self.reconstruction.get_image_cam_from_world(image_id).matrix()
+        
+        # Ensure camera_pose is 4x4
+        if camera_pose.shape == (3, 4):
+            bottom_row = np.array([[0, 0, 0, 1]])
+            camera_pose = np.vstack([camera_pose, bottom_row])
+        
+        # Get original image size from camera
+        image_height = camera.height
+        image_width = camera.width
+        depth_height, depth_width = depth_map.shape
+        
+        # Get COLMAP 3D points visible in this image
+        min_track_length = 3
+        points_3d, points_2d, point_ids = self.reconstruction.get_visible_3d_points(image_id, min_track_length)
+        
+        if len(points_3d) == 0:
+            return []
+        
+        # Generate sparse depth prior from COLMAP points at image resolution
+        colmap_depth_prior, colmap_sparse_mask = self.project_3d_points_to_depth_prior(
+            points_3d, camera_pose, K, (image_width, image_height)
+        )
+        
+        # Scale LiDAR depth map to image resolution for comparison
+        if depth_width != image_width or depth_height != image_height:
+            depth_resized = cv2.resize(depth_map, (image_width, image_height), interpolation=cv2.INTER_LINEAR)
+            confidence_resized = cv2.resize(confidence_map, (image_width, image_height), interpolation=cv2.INTER_LINEAR)
+        else:
+            depth_resized = depth_map
+            confidence_resized = confidence_map
+        
+        # Find valid overlapping points with non-zero confidence
+        lidar_valid_mask = (depth_resized > 0) & (confidence_resized > 0)
+        overlap_mask = colmap_sparse_mask & lidar_valid_mask
+        
+        if not np.any(overlap_mask):
+            return []
+        
+        # Extract overlapping depth values
+        colmap_depths = colmap_depth_prior[overlap_mask]
+        lidar_depths = depth_resized[overlap_mask]
+        confidences = confidence_resized[overlap_mask]
+        
+        # Compute point-wise scales: scale = colmap_depth / lidar_depth
+        # Only include points with valid (non-zero) depths and confidence
+        valid_points = (colmap_depths > 0) & (lidar_depths > 0) & (confidences > 0)
+        
+        if not np.any(valid_points):
+            return []
+        
+        scales = colmap_depths[valid_points] / lidar_depths[valid_points]
+        
+        # Filter out unreasonable scales (likely errors)
+        reasonable_scales = scales[(scales > 0.1) & (scales < 10.0)]
+        
+        return reasonable_scales.tolist()
     
     def load_lidar_data(self, depth_path, confidence_path):
         """
@@ -261,134 +403,17 @@ class LidarPointCloudGenerator:
                 
         return depth_prior, sparse_mask
     
-    def calc_scale_shift(self, sparse_depths, pred_depths, valid_mask):
+    def apply_global_scale(self, depth_map):
         """
-        Calculate scale and shift for depth registration using least squares.
-        
-        Args:
-            sparse_depths: (H, W) sparse depth map from COLMAP
-            pred_depths: (H, W) predicted depth map (LiDAR)
-            valid_mask: (H, W) mask indicating valid overlapping points
-            
-        Returns:
-            scale: scalar scale factor
-            shift: scalar shift factor
-        """
-        if not np.any(valid_mask):
-            return 1.0, 0.0
-        
-        # Get valid depth values
-        sparse_valid = sparse_depths[valid_mask]
-        pred_valid = pred_depths[valid_mask]
-        
-        if len(sparse_valid) < 2:
-            return 1.0, 0.0
-        
-        # Add small noise to avoid numerical issues
-        pred_valid = pred_valid + np.random.rand(*pred_valid.shape) * 1e-5
-        
-        # Set up least squares: sparse_depths = scale * pred_depths + shift
-        # X = [pred_depths, ones], solution = [scale, shift]
-        X = np.stack([pred_valid, np.ones_like(pred_valid)], axis=1)
-        
-        try:
-            # Solve least squares
-            solution = np.linalg.lstsq(X, sparse_valid, rcond=None)[0]
-            scale, shift = solution[0], solution[1]
-            
-            # Sanity check: scale should be positive and reasonable
-            if scale <= 0 or scale > 100 or np.isnan(scale) or np.isnan(shift):
-                print(f"  Warning: Invalid scale/shift computed: scale={scale:.3f}, shift={shift:.3f}, using defaults")
-                return 1.0, 0.0
-                
-            return float(scale), float(shift)
-            
-        except np.linalg.LinAlgError:
-            print("  Warning: Failed to compute scale/shift, using defaults")
-            return 1.0, 0.0
-    
-    def register_depth_to_colmap(self, depth_map, confidence_map, image_id):
-        """
-        Register LiDAR depth map to COLMAP sparse points by computing scale and shift.
+        Apply the precomputed global scale factor to a depth map.
         
         Args:
             depth_map: (H, W) LiDAR depth map
-            confidence_map: (H, W) confidence map
-            image_id: COLMAP image ID
             
         Returns:
-            registered_depth: (H, W) registered depth map
-            registration_mask: (H, W) mask indicating successful registration area
+            scaled_depth: (H, W) globally scaled depth map
         """
-        # Get camera information
-        camera = self.reconstruction.get_image_camera(image_id)
-        K = camera.calibration_matrix()
-        camera_pose = self.reconstruction.get_image_cam_from_world(image_id).matrix()
-        
-        # Ensure camera_pose is 4x4
-        if camera_pose.shape == (3, 4):
-            bottom_row = np.array([[0, 0, 0, 1]])
-            camera_pose = np.vstack([camera_pose, bottom_row])
-        
-        # Get original image size from camera
-        image_height = camera.height
-        image_width = camera.width
-        depth_height, depth_width = depth_map.shape
-        
-        # Calculate scaling factors from depth map to image coordinates
-        scale_u = image_width / depth_width
-        scale_v = image_height / depth_height
-        
-        # Get COLMAP 3D points visible in this image
-        min_track_length = 3
-        points_3d, points_2d, point_ids = self.reconstruction.get_visible_3d_points(image_id, min_track_length)
-        
-        if len(points_3d) == 0:
-            print(f"  Warning: No COLMAP 3D points found for registration in image {image_id}")
-            return depth_map, np.ones_like(depth_map, dtype=bool)
-        
-        print(f"  Found {len(points_3d)} COLMAP 3D points for registration")
-        
-        # Generate sparse depth prior from COLMAP points at image resolution
-        colmap_depth_prior, colmap_sparse_mask = self.project_3d_points_to_depth_prior(
-            points_3d, camera_pose, K, (image_width, image_height)
-        )
-        
-        # Scale LiDAR depth map to image resolution for comparison
-        if depth_width != image_width or depth_height != image_height:
-            # Resize depth map and confidence map to image resolution
-            depth_resized = cv2.resize(depth_map, (image_width, image_height), interpolation=cv2.INTER_LINEAR)
-            confidence_resized = cv2.resize(confidence_map, (image_width, image_height), interpolation=cv2.INTER_LINEAR)
-        else:
-            depth_resized = depth_map
-            confidence_resized = confidence_map
-        
-        # Create valid mask: both COLMAP and LiDAR have valid depths
-        lidar_valid_mask = (depth_resized > 0) & (confidence_resized >= self.args.confidence_threshold)
-        overlap_mask = colmap_sparse_mask & lidar_valid_mask
-        
-        print(f"  COLMAP sparse points: {np.sum(colmap_sparse_mask)}")
-        print(f"  Valid LiDAR points: {np.sum(lidar_valid_mask)}")
-        print(f"  Overlapping points: {np.sum(overlap_mask)}")
-        
-        if np.sum(overlap_mask) < 10:  # Need minimum points for reliable registration
-            print(f"  Warning: Insufficient overlapping points ({np.sum(overlap_mask)}) for registration")
-            return depth_map, np.ones_like(depth_map, dtype=bool)
-        
-        # Calculate scale and shift
-        scale, shift = self.calc_scale_shift(
-            colmap_depth_prior, depth_resized, overlap_mask
-        )
-        
-        print(f"  Computed registration: scale={scale:.3f}, shift={shift:.3f}")
-        
-        # Apply scale and shift to original depth map
-        registered_depth = depth_map * scale + shift
-        
-        # Create registration mask (areas with valid depth)
-        registration_mask = depth_map > 0
-        
-        return registered_depth, registration_mask
+        return depth_map * self.global_scale
     
     def depth_map_to_point_cloud(self, depth_map, confidence_map, image_id):
         """
@@ -513,14 +538,12 @@ class LidarPointCloudGenerator:
                 print(f"  Valid depth pixels: {np.sum(depth_map > 0)}")
                 print(f"  High confidence pixels: {np.sum(confidence_map >= self.args.confidence_threshold)}")
                 
-                # Register LiDAR depth to COLMAP sparse points
-                registered_depth, registration_mask = self.register_depth_to_colmap(
-                    depth_map, confidence_map, pair['image_id']
-                )
+                # Apply global scale to LiDAR depth
+                scaled_depth = self.apply_global_scale(depth_map)
                 
-                # Convert to point cloud using registered depth
+                # Convert to point cloud using scaled depth
                 points_3d, colors = self.depth_map_to_point_cloud(
-                    registered_depth, confidence_map, pair['image_id']
+                    scaled_depth, confidence_map, pair['image_id']
                 )
                 
                 if len(points_3d) > 0:
@@ -571,7 +594,8 @@ class LidarPointCloudGenerator:
     
     def run(self):
         """Run the complete pipeline."""
-        print("Starting LiDAR point cloud generation...")
+        print("Starting LiDAR point cloud generation with global scale registration...")
+        print(f"Using global scale factor: {self.global_scale:.3f}")
         
         # Process all pairs and merge point clouds
         merged_points, merged_colors = self.process_all_pairs()
@@ -581,6 +605,7 @@ class LidarPointCloudGenerator:
         self.save_point_cloud(merged_points, merged_colors, output_path)
         
         print(f"\nComplete! Merged point cloud saved to: {output_path}")
+        print(f"Applied global scale factor: {self.global_scale:.3f} to all depth maps")
 
 
 def main():
