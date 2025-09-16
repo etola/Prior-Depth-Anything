@@ -25,6 +25,11 @@ import cv2
 from tqdm import tqdm
 import open3d as o3d
 import re
+import torch
+import torch.nn.functional as F
+
+# Prior Depth Anything imports
+from prior_depth_anything import PriorDepthAnything
 
 # COLMAP utilities
 from colmap_utils import ColmapReconstruction
@@ -33,7 +38,7 @@ from colmap_utils import ColmapReconstruction
 def parse_args():
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(
-        description="Convert LiDAR depth maps to point cloud using COLMAP calibration"
+        description="Convert LiDAR depth maps to point clouds using COLMAP calibration with optional depth completion. Saves individual and merged point clouds to output folder."
     )
     parser.add_argument(
         "-s", "--scene_folder", 
@@ -42,16 +47,33 @@ def parse_args():
         help="Path to scene folder containing images/, sparse/, and lidar/ subdirectories"
     )
     parser.add_argument(
-        "--confidence_threshold", 
+        "-c", "--confidence_threshold", 
         type=float, 
         default=0.5,
         help="Minimum confidence threshold for LiDAR points (default: 0.5)"
     )
     parser.add_argument(
-        "--output_name", 
+        "-o", "--output_folder", 
         type=str, 
-        default="merged_lidar_pointcloud.ply",
-        help="Output PLY filename (default: merged_lidar_pointcloud.ply)"
+        default="output",
+        help="Output folder for point clouds (default: output)"
+    )
+    parser.add_argument(
+        "-d", "--device", 
+        type=str, 
+        default="cuda" if torch.cuda.is_available() else "cpu",
+        help="Device to use for computation"
+    )
+    parser.add_argument(
+        "-t", "--target_size", 
+        type=int, 
+        default=518,
+        help="Target image size for processing (default: 518)"
+    )
+    parser.add_argument(
+        "-e", "--enable_depth_completion", 
+        action="store_true",
+        help="Enable depth completion using Prior Depth Anything (default: False)"
     )
     
     return parser.parse_args()
@@ -62,21 +84,34 @@ class LidarPointCloudGenerator:
     
     def __init__(self, args):
         self.args = args
+        self.device = torch.device(args.device)
+        self.target_size = args.target_size
         
         # Initialize scene paths
         self.scene_folder = Path(args.scene_folder)
         self.images_folder = self.scene_folder / "images"
         self.sparse_folder = self.scene_folder / "sparse"
         self.lidar_folder = self.scene_folder / "lidar"
+        self.output_folder = self.scene_folder / args.output_folder
         
         # Validate input paths
         self._validate_paths()
+        
+        # Initialize Prior Depth Anything model only if depth completion is enabled
+        if args.enable_depth_completion:
+            self._init_model()
+        else:
+            self.prior_depth_anything = None
         
         # Load COLMAP reconstruction
         self._load_colmap_reconstruction()
         
         # Find matching image-lidar pairs
         self._find_matching_pairs()
+        
+        # Create output directory
+        self.output_folder.mkdir(exist_ok=True, parents=True)
+        print(f"Output folder: {self.output_folder}")
         
         # Compute global scale factor
         self.global_scale = self._compute_global_scale_factor()
@@ -92,6 +127,16 @@ class LidarPointCloudGenerator:
         if not self.lidar_folder.exists():
             raise FileNotFoundError(f"LiDAR folder not found: {self.lidar_folder}")
             
+    def _init_model(self):
+        """Initialize Prior Depth Anything model."""
+        print("Initializing Prior Depth Anything...")
+        
+        # Initialize PriorDepthAnything which handles model downloads automatically
+        self.prior_depth_anything = PriorDepthAnything(
+            device=str(self.device),
+            coarse_only=False  # We want both coarse and fine processing
+        )
+        
     def _load_colmap_reconstruction(self):
         """Load COLMAP reconstruction."""
         print(f"Loading COLMAP reconstruction from {self.sparse_folder}")
@@ -415,6 +460,359 @@ class LidarPointCloudGenerator:
         """
         return depth_map * self.global_scale
     
+    def get_individual_output_filename(self, depth_filename, processing_mode="simple"):
+        """
+        Generate individual point cloud filename from depth filename.
+        
+        Args:
+            depth_filename: Original depth filename (e.g., "depthmap_00001.tiff")
+            processing_mode: "simple" or "completed"
+            
+        Returns:
+            Path to individual point cloud file
+        """
+        # Extract the base name without extension (e.g., "depthmap_00001")
+        base_name = Path(depth_filename).stem
+        
+        # Create output filename based on processing mode
+        if processing_mode == "completed":
+            output_filename = f"{base_name}_completed.ply"
+        else:
+            output_filename = f"{base_name}_simple.ply"
+        
+        return self.output_folder / output_filename
+    
+    def resize_and_scale_calibration(self, camera, original_size, target_size):
+        """
+        Resize image and scale camera calibration.
+        
+        Args:
+            camera: COLMAP camera object
+            original_size: (width, height) of original image
+            target_size: target size (518) 
+            
+        Returns:
+            new_size: (width, height) of resized image
+            scaled_K: (3, 3) scaled intrinsic matrix accounting for cropping
+            crop_offset_y: vertical offset due to center cropping (0 if no crop)
+        """
+        orig_w, orig_h = original_size
+        
+        # Simple resize maintaining aspect ratio, make width = target_size
+        new_w = target_size
+        # Calculate height maintaining aspect ratio, divisible by 14
+        resized_h = round(orig_h * (new_w / orig_w) / 14) * 14
+        
+        # Center crop height if it's larger than target_size
+        crop_offset_y = 0
+        if resized_h > target_size:
+            crop_offset_y = (resized_h - target_size) // 2
+            final_h = target_size
+        else:
+            final_h = resized_h
+        
+        # Scale intrinsic matrix accounting for resize and crop
+        K = camera.calibration_matrix()
+        scale_x = new_w / orig_w
+        scale_y = resized_h / orig_h  # Use the full resized height for scaling
+        
+        scaled_K = K.copy()
+        scaled_K[0, 0] *= scale_x  # fx
+        scaled_K[1, 1] *= scale_y  # fy  
+        scaled_K[0, 2] *= scale_x  # cx
+        scaled_K[1, 2] = scaled_K[1, 2] * scale_y - crop_offset_y  # cy adjusted for crop
+        
+        return (new_w, final_h), scaled_K, crop_offset_y
+    
+    def combine_lidar_colmap_priors(self, scaled_lidar_depth, confidence_map, colmap_depth_prior, colmap_sparse_mask, image_size):
+        """
+        Combine LiDAR depth and COLMAP depth priors into a unified sparse depth map.
+        
+        Args:
+            scaled_lidar_depth: (H, W) scaled LiDAR depth map
+            confidence_map: (H, W) confidence map for LiDAR
+            colmap_depth_prior: (H, W) COLMAP sparse depth map
+            colmap_sparse_mask: (H, W) mask for COLMAP depths
+            image_size: (width, height) target image size
+            
+        Returns:
+            combined_depth: (H, W) combined sparse depth map
+            combined_mask: (H, W) mask indicating valid sparse depths
+        """
+        height, width = image_size[1], image_size[0]
+        
+        # Initialize combined depth map
+        combined_depth = np.zeros((height, width), dtype=np.float32)
+        combined_mask = np.zeros((height, width), dtype=bool)
+        
+        # Resize LiDAR data to target size if needed
+        if scaled_lidar_depth.shape != (height, width):
+            lidar_resized = cv2.resize(scaled_lidar_depth, (width, height), interpolation=cv2.INTER_LINEAR)
+            confidence_resized = cv2.resize(confidence_map, (width, height), interpolation=cv2.INTER_LINEAR)
+        else:
+            lidar_resized = scaled_lidar_depth
+            confidence_resized = confidence_map
+        
+        # Add LiDAR depths where confidence is high
+        lidar_valid = (lidar_resized > 0) & (confidence_resized >= self.args.confidence_threshold)
+        combined_depth[lidar_valid] = lidar_resized[lidar_valid]
+        combined_mask[lidar_valid] = True
+        
+        # Add COLMAP depths (they take priority over LiDAR where both exist)
+        combined_depth[colmap_sparse_mask] = colmap_depth_prior[colmap_sparse_mask]
+        combined_mask[colmap_sparse_mask] = True
+        
+        return combined_depth, combined_mask
+    
+    def complete_depth_with_priors(self, image, combined_depth_prior, combined_sparse_mask):
+        """
+        Complete depth using Prior Depth Anything with combined LiDAR and COLMAP priors.
+        
+        Args:
+            image: (H, W, 3) uint8 image
+            combined_depth_prior: (H, W) combined sparse depth map
+            combined_sparse_mask: (H, W) mask indicating valid prior depths
+            
+        Returns:
+            completed_depth: (H, W) completed depth map
+        """
+        print(f"DEBUG: Input shapes - image: {image.shape}, combined_depth_prior: {combined_depth_prior.shape}, combined_sparse_mask: {combined_sparse_mask.shape}")
+        
+        if not np.any(combined_sparse_mask):
+            print("Warning: No valid depth priors found, cannot complete")
+            return np.zeros_like(combined_depth_prior)
+        
+        print(f"DEBUG: Found {np.sum(combined_sparse_mask)} valid combined sparse points")
+        
+        # Prepare tensors for Prior Depth Anything
+        image_tensor = torch.from_numpy(image.astype(np.uint8)).permute(2, 0, 1).unsqueeze(0).to(self.device)
+        depth_prior_tensor = torch.from_numpy(combined_depth_prior.astype(np.float32)).unsqueeze(0).to(self.device)
+        sparse_mask_tensor = torch.from_numpy(combined_sparse_mask.astype(bool)).unsqueeze(0).unsqueeze(1).to(self.device)
+        
+        print(f"DEBUG: Tensor shapes - image_tensor: {image_tensor.shape}, depth_prior_tensor: {depth_prior_tensor.shape}, sparse_mask_tensor: {sparse_mask_tensor.shape}")
+        
+        try:
+            print("DEBUG: Calling Prior Depth Anything...")
+            # Use Prior Depth Anything for depth completion with combined priors
+            result = self.prior_depth_anything(
+                images=image_tensor,
+                sparse_depths=depth_prior_tensor,
+                sparse_masks=sparse_mask_tensor,
+            )
+            print(f"DEBUG: Prior Depth Anything result shape: {result.shape}")
+            
+        except Exception as e:
+            print(f"ERROR in Prior Depth Anything call: {e}")
+            print(f"ERROR: Input tensor shapes were:")
+            print(f"  - images: {image_tensor.shape}")
+            print(f"  - sparse_depths: {depth_prior_tensor.shape}")
+            print(f"  - sparse_masks: {sparse_mask_tensor.shape}")
+            raise e
+        
+        # Extract completed depth and convert back to numpy
+        completed_depth = result.squeeze().detach().cpu().numpy().astype(np.float32)
+        print(f"DEBUG: Final completed depth shape: {completed_depth.shape}")
+        return completed_depth
+    
+    def generate_point_cloud_from_completed_depth(self, image, depth_map, scaled_K, camera_pose, image_id):
+        """
+        Generate point cloud from completed depth map.
+        
+        Args:
+            image: (H, W, 3) image array
+            depth_map: (H, W) completed depth map
+            scaled_K: (3, 3) scaled intrinsic matrix
+            camera_pose: (4, 4) camera pose matrix
+            image_id: COLMAP image ID for naming
+            
+        Returns:
+            points_3d: (N, 3) 3D points in world coordinates
+            colors: (N, 3) RGB colors for points
+        """
+        height, width = depth_map.shape
+        
+        # Create coordinate grids
+        u_coords, v_coords = np.meshgrid(np.arange(width), np.arange(height))
+        
+        # Valid depth mask
+        valid_mask = depth_map > 0
+        
+        if not np.any(valid_mask):
+            return np.array([]).reshape(0, 3), np.array([]).reshape(0, 3)
+        
+        # Get valid coordinates and depths
+        u_valid = u_coords[valid_mask]
+        v_valid = v_coords[valid_mask]
+        depth_valid = depth_map[valid_mask]
+        
+        # Unproject to camera coordinates
+        K_inv = np.linalg.inv(scaled_K)
+        
+        # Create homogeneous pixel coordinates
+        pixel_coords = np.stack([u_valid, v_valid, np.ones_like(u_valid)], axis=0)
+        
+        # Unproject to camera coordinates
+        cam_coords = K_inv @ pixel_coords
+        cam_coords = cam_coords * depth_valid[np.newaxis, :]
+        
+        # Add homogeneous coordinate
+        cam_coords_homo = np.concatenate([cam_coords, np.ones((1, len(depth_valid)))], axis=0)
+        
+        # Transform to world coordinates
+        if camera_pose.shape == (3, 4):
+            # Add bottom row [0, 0, 0, 1] to make it 4x4
+            bottom_row = np.array([[0, 0, 0, 1]])
+            camera_pose_4x4 = np.vstack([camera_pose, bottom_row])
+        else:
+            camera_pose_4x4 = camera_pose
+            
+        world_from_cam = np.linalg.inv(camera_pose_4x4)
+        world_coords = (world_from_cam @ cam_coords_homo).T[:, :3]
+        
+        # Get corresponding colors
+        colors = image[valid_mask] / 255.0  # Normalize to [0, 1]
+        
+        return world_coords, colors
+    
+    def process_frame_simple(self, pair):
+        """
+        Process a single frame without depth completion (simple LiDAR point cloud generation).
+        
+        Args:
+            pair: Dictionary containing image and LiDAR file information
+            
+        Returns:
+            points_3d: (N, 3) 3D points in world coordinates
+            colors: (N, 3) RGB colors for points
+        """
+        # Load LiDAR data
+        depth_map, confidence_map = self.load_lidar_data(
+            pair['depth_path'], pair['confidence_path']
+        )
+        
+        print(f"Processing {pair['image_name']} -> {pair['depth_path'].name} (simple)")
+        print(f"  Depth map shape: {depth_map.shape}")
+        print(f"  Valid depth pixels: {np.sum(depth_map > 0)}")
+        print(f"  High confidence pixels: {np.sum(confidence_map >= self.args.confidence_threshold)}")
+        
+        # Apply global scale to LiDAR depth
+        scaled_depth = self.apply_global_scale(depth_map)
+        
+        # Convert to point cloud using scaled depth
+        points_3d, colors = self.depth_map_to_point_cloud(
+            scaled_depth, confidence_map, pair['image_id']
+        )
+        
+        print(f"  Generated {len(points_3d)} 3D points from LiDAR")
+        
+        # Save individual point cloud
+        individual_output_path = self.get_individual_output_filename(
+            pair['depth_path'].name, "simple"
+        )
+        if len(points_3d) > 0:
+            self.save_point_cloud(points_3d, colors, individual_output_path)
+            print(f"  Saved individual point cloud: {individual_output_path}")
+        
+        return points_3d, colors
+    
+    def process_frame_with_completion(self, pair):
+        """
+        Process a single frame with depth completion using combined LiDAR and COLMAP priors.
+        
+        Args:
+            pair: Dictionary containing image and LiDAR file information
+            
+        Returns:
+            points_3d: (N, 3) 3D points in world coordinates
+            colors: (N, 3) RGB colors for points
+        """
+        # Load LiDAR data
+        depth_map, confidence_map = self.load_lidar_data(
+            pair['depth_path'], pair['confidence_path']
+        )
+        
+        print(f"Processing {pair['image_name']} -> {pair['depth_path'].name} (with completion)")
+        print(f"  Depth map shape: {depth_map.shape}")
+        print(f"  Valid depth pixels: {np.sum(depth_map > 0)}")
+        print(f"  High confidence pixels: {np.sum(confidence_map >= self.args.confidence_threshold)}")
+        
+        # Load and resize image
+        image_pil = Image.open(pair['image_path']).convert('RGB')
+        original_size = image_pil.size  # (width, height)
+        
+        # Get camera information
+        camera = self.reconstruction.get_image_camera(pair['image_id'])
+        camera_pose = self.reconstruction.get_image_cam_from_world(pair['image_id']).matrix()
+        
+        # Resize image and scale calibration
+        new_size, scaled_K, crop_offset_y = self.resize_and_scale_calibration(
+            camera, original_size, self.target_size
+        )
+        
+        # Resize image
+        orig_w, orig_h = original_size
+        resized_w = self.target_size
+        resized_h = round(orig_h * (resized_w / orig_w) / 14) * 14
+        
+        image_resized = image_pil.resize((resized_w, resized_h), Image.Resampling.BICUBIC)
+        
+        # Center crop if needed
+        if resized_h > self.target_size:
+            start_y = (resized_h - self.target_size) // 2
+            image_resized = image_resized.crop((0, start_y, resized_w, start_y + self.target_size))
+        
+        image_array = np.array(image_resized)
+        print(f"  Final image array shape: {image_array.shape}")
+        
+        # Apply global scale to LiDAR depth
+        scaled_lidar_depth = self.apply_global_scale(depth_map)
+        
+        # Get COLMAP 3D points and create sparse depth prior
+        min_track_length = 3
+        points_3d, points_2d, point_ids = self.reconstruction.get_visible_3d_points(pair['image_id'], min_track_length)
+        print(f"  Found {len(points_3d)} COLMAP 3D points with track length >= {min_track_length}")
+        
+        # Ensure camera_pose is 4x4
+        if camera_pose.shape == (3, 4):
+            bottom_row = np.array([[0, 0, 0, 1]])
+            camera_pose = np.vstack([camera_pose, bottom_row])
+        
+        # Project 3D points to create COLMAP depth prior
+        colmap_depth_prior, colmap_sparse_mask = self.project_3d_points_to_depth_prior(
+            points_3d, camera_pose, scaled_K, new_size
+        )
+        
+        # Combine LiDAR and COLMAP priors
+        combined_depth_prior, combined_sparse_mask = self.combine_lidar_colmap_priors(
+            scaled_lidar_depth, confidence_map, colmap_depth_prior, colmap_sparse_mask, new_size
+        )
+        
+        print(f"  Combined prior has {np.sum(combined_sparse_mask)} valid pixels")
+        print(f"    LiDAR contribution: {np.sum((combined_sparse_mask) & (~colmap_sparse_mask))}")
+        print(f"    COLMAP contribution: {np.sum(colmap_sparse_mask)}")
+        
+        # Complete depth using combined priors
+        completed_depth = self.complete_depth_with_priors(
+            image_array, combined_depth_prior, combined_sparse_mask
+        )
+        
+        # Generate point cloud from completed depth
+        points_3d, colors = self.generate_point_cloud_from_completed_depth(
+            image_array, completed_depth, scaled_K, camera_pose, pair['image_id']
+        )
+        
+        print(f"  Generated {len(points_3d)} 3D points from completed depth")
+        
+        # Save individual point cloud
+        individual_output_path = self.get_individual_output_filename(
+            pair['depth_path'].name, "completed"
+        )
+        if len(points_3d) > 0:
+            self.save_point_cloud(points_3d, colors, individual_output_path)
+            print(f"  Saved individual point cloud: {individual_output_path}")
+        
+        return points_3d, colors
+    
     def depth_map_to_point_cloud(self, depth_map, confidence_map, image_id):
         """
         Convert depth map to point cloud using COLMAP calibration.
@@ -520,48 +918,71 @@ class LidarPointCloudGenerator:
         return world_coords, colors
     
     def process_all_pairs(self):
-        """Process all matching image-LiDAR pairs and create point clouds."""
-        all_points = []
-        all_colors = []
+        """Process all matching image-LiDAR pairs and create individual point clouds."""
+        frame_point_clouds = []
         
         print(f"Processing {len(self.matching_pairs)} image-LiDAR pairs...")
         
-        for pair in tqdm(self.matching_pairs, desc="Converting depth maps"):
+        # Determine processing mode
+        processing_desc = "with depth completion" if self.args.enable_depth_completion else "simple LiDAR"
+        
+        for pair in tqdm(self.matching_pairs, desc=f"Processing {processing_desc}"):
             try:
-                # Load LiDAR data
-                depth_map, confidence_map = self.load_lidar_data(
-                    pair['depth_path'], pair['confidence_path']
-                )
-                
-                print(f"Processing {pair['image_name']} -> {pair['depth_path'].name}")
-                print(f"  Depth map shape: {depth_map.shape}")
-                print(f"  Valid depth pixels: {np.sum(depth_map > 0)}")
-                print(f"  High confidence pixels: {np.sum(confidence_map >= self.args.confidence_threshold)}")
-                
-                # Apply global scale to LiDAR depth
-                scaled_depth = self.apply_global_scale(depth_map)
-                
-                # Convert to point cloud using scaled depth
-                points_3d, colors = self.depth_map_to_point_cloud(
-                    scaled_depth, confidence_map, pair['image_id']
-                )
+                # Choose processing method based on depth completion setting
+                if self.args.enable_depth_completion:
+                    points_3d, colors = self.process_frame_with_completion(pair)
+                else:
+                    points_3d, colors = self.process_frame_simple(pair)
                 
                 if len(points_3d) > 0:
-                    all_points.append(points_3d)
-                    all_colors.append(colors)
-                    print(f"  Generated {len(points_3d)} 3D points")
+                    frame_point_clouds.append({
+                        'points': points_3d,
+                        'colors': colors,
+                        'frame_name': pair['image_name']
+                    })
                 else:
-                    print(f"  No valid points generated")
+                    print(f"  No valid points generated for {pair['image_name']}")
                     
             except Exception as e:
                 print(f"Error processing {pair['image_name']}: {e}")
+                import traceback
+                traceback.print_exc()
                 continue
         
-        if len(all_points) == 0:
+        if len(frame_point_clouds) == 0:
             raise ValueError("No point clouds were generated from LiDAR data")
         
+        return frame_point_clouds
+    
+    def merge_point_clouds(self, frame_point_clouds):
+        """
+        Merge individual point clouds from all frames.
+        
+        Args:
+            frame_point_clouds: List of dictionaries containing point clouds per frame
+            
+        Returns:
+            merged_points: (N, 3) merged 3D points
+            merged_colors: (N, 3) merged colors
+        """
+        print(f"Merging {len(frame_point_clouds)} point clouds...")
+        
+        all_points = []
+        all_colors = []
+        
+        total_points = 0
+        for frame_pc in frame_point_clouds:
+            points = frame_pc['points']
+            colors = frame_pc['colors']
+            frame_name = frame_pc['frame_name']
+            
+            all_points.append(points)
+            all_colors.append(colors)
+            total_points += len(points)
+            
+            print(f"  {frame_name}: {len(points)} points")
+        
         # Merge all point clouds
-        print("Merging point clouds...")
         merged_points = np.vstack(all_points)
         merged_colors = np.vstack(all_colors)
         
@@ -594,18 +1015,39 @@ class LidarPointCloudGenerator:
     
     def run(self):
         """Run the complete pipeline."""
-        print("Starting LiDAR point cloud generation with global scale registration...")
+        if self.args.enable_depth_completion:
+            print("Starting LiDAR point cloud generation with depth completion...")
+            print(f"Target image size: {self.target_size}")
+            print(f"Device: {self.device}")
+        else:
+            print("Starting LiDAR point cloud generation (simple mode)...")
+        
         print(f"Using global scale factor: {self.global_scale:.3f}")
+        print(f"Depth completion: {'enabled' if self.args.enable_depth_completion else 'disabled'}")
         
-        # Process all pairs and merge point clouds
-        merged_points, merged_colors = self.process_all_pairs()
+        # Process all pairs and get individual point clouds
+        frame_point_clouds = self.process_all_pairs()
         
-        # Save merged point cloud
-        output_path = self.scene_folder / self.args.output_name
-        self.save_point_cloud(merged_points, merged_colors, output_path)
+        # Merge all point clouds
+        merged_points, merged_colors = self.merge_point_clouds(frame_point_clouds)
         
-        print(f"\nComplete! Merged point cloud saved to: {output_path}")
-        print(f"Applied global scale factor: {self.global_scale:.3f} to all depth maps")
+        # Save merged point cloud with appropriate name
+        if self.args.enable_depth_completion:
+            merged_output_path = self.output_folder / "merged_completed.ply"
+        else:
+            merged_output_path = self.output_folder / "merged_lidar.ply"
+        
+        self.save_point_cloud(merged_points, merged_colors, merged_output_path)
+        
+        print(f"\nComplete! Output saved to folder: {self.output_folder}")
+        print(f"Individual point clouds: {len(frame_point_clouds)} files")
+        print(f"Merged point cloud: {merged_output_path}")
+        print(f"Used global scale factor: {self.global_scale:.3f}")
+        
+        if self.args.enable_depth_completion:
+            print(f"Combined LiDAR depth and COLMAP priors for depth completion")
+        else:
+            print(f"Generated point clouds directly from registered LiDAR data")
 
 
 def main():
