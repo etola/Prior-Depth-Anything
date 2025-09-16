@@ -466,7 +466,7 @@ class LidarPointCloudGenerator:
         
         Args:
             depth_filename: Original depth filename (e.g., "depthmap_00001.tiff")
-            processing_mode: "simple" or "completed"
+            processing_mode: "simple", "completed", or "prior"
             
         Returns:
             Path to individual point cloud file
@@ -477,6 +477,8 @@ class LidarPointCloudGenerator:
         # Create output filename based on processing mode
         if processing_mode == "completed":
             output_filename = f"{base_name}_completed.ply"
+        elif processing_mode == "prior":
+            output_filename = f"{base_name}_prior.ply"
         else:
             output_filename = f"{base_name}_simple.ply"
         
@@ -541,48 +543,114 @@ class LidarPointCloudGenerator:
         """
         height, width = image_size[1], image_size[0]
         
+        print(f"    DEBUG combine_lidar_colmap_priors:")
+        print(f"      Target size: {width}x{height}")
+        print(f"      LiDAR depth shape: {scaled_lidar_depth.shape}")
+        print(f"      COLMAP prior shape: {colmap_depth_prior.shape}")
+        
         # Initialize combined depth map
         combined_depth = np.zeros((height, width), dtype=np.float32)
         combined_mask = np.zeros((height, width), dtype=bool)
         
         # Resize LiDAR data to target size if needed
         if scaled_lidar_depth.shape != (height, width):
+            print(f"      Resizing LiDAR from {scaled_lidar_depth.shape} to {height}x{width}")
             lidar_resized = cv2.resize(scaled_lidar_depth, (width, height), interpolation=cv2.INTER_LINEAR)
             confidence_resized = cv2.resize(confidence_map, (width, height), interpolation=cv2.INTER_LINEAR)
+            
+            # Debug: Check if resizing affected depth values significantly
+            if np.any(scaled_lidar_depth > 0):
+                orig_valid_depths = scaled_lidar_depth[scaled_lidar_depth > 0]
+                resized_valid_depths = lidar_resized[lidar_resized > 0]
+                print(f"      Original LiDAR depth range: {orig_valid_depths.min():.3f} to {orig_valid_depths.max():.3f}")
+                print(f"      Resized LiDAR depth range: {resized_valid_depths.min():.3f} to {resized_valid_depths.max():.3f}")
         else:
             lidar_resized = scaled_lidar_depth
             confidence_resized = confidence_map
+            print(f"      No LiDAR resizing needed")
         
         # Add LiDAR depths where confidence is high
         lidar_valid = (lidar_resized > 0) & (confidence_resized >= self.args.confidence_threshold)
         combined_depth[lidar_valid] = lidar_resized[lidar_valid]
         combined_mask[lidar_valid] = True
         
+        print(f"      LiDAR valid pixels: {np.sum(lidar_valid)}")
+        
         # Add COLMAP depths (they take priority over LiDAR where both exist)
         combined_depth[colmap_sparse_mask] = colmap_depth_prior[colmap_sparse_mask]
         combined_mask[colmap_sparse_mask] = True
         
+        print(f"      COLMAP valid pixels: {np.sum(colmap_sparse_mask)}")
+        print(f"      Combined valid pixels: {np.sum(combined_mask)}")
+        
         return combined_depth, combined_mask
+    
+    def prepare_lidar_prior(self, scaled_lidar_depth, confidence_map, image_size):
+        """
+        Prepare LiDAR-only depth prior for completion.
+        
+        Args:
+            scaled_lidar_depth: (H, W) scaled LiDAR depth map
+            confidence_map: (H, W) confidence map for LiDAR
+            image_size: (width, height) target image size
+            
+        Returns:
+            lidar_depth_prior: (H, W) LiDAR sparse depth map
+            lidar_sparse_mask: (H, W) mask indicating valid sparse depths
+        """
+        height, width = image_size[1], image_size[0]
+        
+        print(f"    DEBUG prepare_lidar_prior:")
+        print(f"      Target size: {width}x{height}")
+        print(f"      LiDAR depth shape: {scaled_lidar_depth.shape}")
+        
+        # Resize LiDAR data to target size if needed
+        if scaled_lidar_depth.shape != (height, width):
+            print(f"      Resizing LiDAR from {scaled_lidar_depth.shape} to {height}x{width}")
+            lidar_resized = cv2.resize(scaled_lidar_depth, (width, height), interpolation=cv2.INTER_LINEAR)
+            confidence_resized = cv2.resize(confidence_map, (width, height), interpolation=cv2.INTER_LINEAR)
+            
+            # Debug: Check if resizing affected depth values significantly
+            if np.any(scaled_lidar_depth > 0):
+                orig_valid_depths = scaled_lidar_depth[scaled_lidar_depth > 0]
+                resized_valid_depths = lidar_resized[lidar_resized > 0]
+                print(f"      Original LiDAR depth range: {orig_valid_depths.min():.3f} to {orig_valid_depths.max():.3f}")
+                print(f"      Resized LiDAR depth range: {resized_valid_depths.min():.3f} to {resized_valid_depths.max():.3f}")
+        else:
+            lidar_resized = scaled_lidar_depth
+            confidence_resized = confidence_map
+            print(f"      No LiDAR resizing needed")
+        
+        # Create LiDAR prior based on confidence threshold
+        lidar_valid = (lidar_resized > 0) & (confidence_resized >= self.args.confidence_threshold)
+        
+        # Initialize depth prior
+        lidar_depth_prior = np.zeros((height, width), dtype=np.float32)
+        lidar_depth_prior[lidar_valid] = lidar_resized[lidar_valid]
+        
+        print(f"      LiDAR valid pixels: {np.sum(lidar_valid)}")
+        
+        return lidar_depth_prior, lidar_valid
     
     def complete_depth_with_priors(self, image, combined_depth_prior, combined_sparse_mask):
         """
-        Complete depth using Prior Depth Anything with combined LiDAR and COLMAP priors.
+        Complete depth using Prior Depth Anything with LiDAR-only priors.
         
         Args:
             image: (H, W, 3) uint8 image
-            combined_depth_prior: (H, W) combined sparse depth map
+            combined_depth_prior: (H, W) LiDAR sparse depth map
             combined_sparse_mask: (H, W) mask indicating valid prior depths
             
         Returns:
             completed_depth: (H, W) completed depth map
         """
-        print(f"DEBUG: Input shapes - image: {image.shape}, combined_depth_prior: {combined_depth_prior.shape}, combined_sparse_mask: {combined_sparse_mask.shape}")
+        print(f"DEBUG: Input shapes - image: {image.shape}, lidar_depth_prior: {combined_depth_prior.shape}, lidar_sparse_mask: {combined_sparse_mask.shape}")
         
         if not np.any(combined_sparse_mask):
-            print("Warning: No valid depth priors found, cannot complete")
+            print("Warning: No valid LiDAR depth priors found, cannot complete")
             return np.zeros_like(combined_depth_prior)
         
-        print(f"DEBUG: Found {np.sum(combined_sparse_mask)} valid combined sparse points")
+        print(f"DEBUG: Found {np.sum(combined_sparse_mask)} valid LiDAR sparse points")
         
         # Prepare tensors for Prior Depth Anything
         image_tensor = torch.from_numpy(image.astype(np.uint8)).permute(2, 0, 1).unsqueeze(0).to(self.device)
@@ -612,6 +680,21 @@ class LidarPointCloudGenerator:
         # Extract completed depth and convert back to numpy
         completed_depth = result.squeeze().detach().cpu().numpy().astype(np.float32)
         print(f"DEBUG: Final completed depth shape: {completed_depth.shape}")
+        
+        # Debug: Check if the completion preserved the input priors
+        if np.any(combined_sparse_mask):
+            input_prior_values = combined_depth_prior[combined_sparse_mask]
+            output_prior_positions = completed_depth[combined_sparse_mask]
+            
+            # Check how much the priors changed
+            if len(input_prior_values) > 0 and len(output_prior_positions) > 0:
+                prior_diff = np.abs(input_prior_values - output_prior_positions)
+                print(f"DEBUG: LiDAR prior preservation check:")
+                print(f"  Input LiDAR prior range: {input_prior_values.min():.3f} to {input_prior_values.max():.3f}")
+                print(f"  Output at LiDAR prior positions: {output_prior_positions.min():.3f} to {output_prior_positions.max():.3f}")
+                print(f"  Mean absolute difference: {prior_diff.mean():.3f}")
+                print(f"  Max absolute difference: {prior_diff.max():.3f}")
+        
         return completed_depth
     
     def generate_point_cloud_from_completed_depth(self, image, depth_map, scaled_K, camera_pose, image_id):
@@ -712,12 +795,24 @@ class LidarPointCloudGenerator:
         if len(points_3d) > 0:
             self.save_point_cloud(points_3d, colors, individual_output_path)
             print(f"  Saved individual point cloud: {individual_output_path}")
+            
+            # Debug: Check simple point cloud bounds for comparison
+            if len(points_3d) > 100:  # Only if we have enough points
+                simple_bounds = {
+                    'x_min': points_3d[:, 0].min(), 'x_max': points_3d[:, 0].max(),
+                    'y_min': points_3d[:, 1].min(), 'y_max': points_3d[:, 1].max(),
+                    'z_min': points_3d[:, 2].min(), 'z_max': points_3d[:, 2].max()
+                }
+                print(f"  Simple point cloud bounds:")
+                print(f"    X: {simple_bounds['x_min']:.3f} to {simple_bounds['x_max']:.3f}")
+                print(f"    Y: {simple_bounds['y_min']:.3f} to {simple_bounds['y_max']:.3f}")
+                print(f"    Z: {simple_bounds['z_min']:.3f} to {simple_bounds['z_max']:.3f}")
         
         return points_3d, colors
     
     def process_frame_with_completion(self, pair):
         """
-        Process a single frame with depth completion using combined LiDAR and COLMAP priors.
+        Process a single frame with depth completion using LiDAR-only priors.
         
         Args:
             pair: Dictionary containing image and LiDAR file information
@@ -754,47 +849,67 @@ class LidarPointCloudGenerator:
         resized_w = self.target_size
         resized_h = round(orig_h * (resized_w / orig_w) / 14) * 14
         
+        print(f"  Image resizing: {original_size} -> {resized_w}x{resized_h}")
+        print(f"  Crop offset y: {crop_offset_y}")
+        
         image_resized = image_pil.resize((resized_w, resized_h), Image.Resampling.BICUBIC)
         
         # Center crop if needed
         if resized_h > self.target_size:
             start_y = (resized_h - self.target_size) // 2
             image_resized = image_resized.crop((0, start_y, resized_w, start_y + self.target_size))
+            print(f"  Applied center crop: y={start_y} to y={start_y + self.target_size}")
         
         image_array = np.array(image_resized)
         print(f"  Final image array shape: {image_array.shape}")
+        print(f"  Target processing size: {new_size}")
+        
+        # Debug: Check camera calibration matrix
+        print(f"  Original camera calibration matrix:")
+        print(f"    K = {camera.calibration_matrix()}")
+        print(f"  Scaled camera calibration matrix:")
+        print(f"    scaled_K = {scaled_K}")
         
         # Apply global scale to LiDAR depth
         scaled_lidar_depth = self.apply_global_scale(depth_map)
-        
-        # Get COLMAP 3D points and create sparse depth prior
-        min_track_length = 3
-        points_3d, points_2d, point_ids = self.reconstruction.get_visible_3d_points(pair['image_id'], min_track_length)
-        print(f"  Found {len(points_3d)} COLMAP 3D points with track length >= {min_track_length}")
         
         # Ensure camera_pose is 4x4
         if camera_pose.shape == (3, 4):
             bottom_row = np.array([[0, 0, 0, 1]])
             camera_pose = np.vstack([camera_pose, bottom_row])
         
-        # Project 3D points to create COLMAP depth prior
-        colmap_depth_prior, colmap_sparse_mask = self.project_3d_points_to_depth_prior(
-            points_3d, camera_pose, scaled_K, new_size
+        # Use only LiDAR as prior (no COLMAP points)
+        lidar_depth_prior, lidar_sparse_mask = self.prepare_lidar_prior(
+            scaled_lidar_depth, confidence_map, new_size
         )
         
-        # Combine LiDAR and COLMAP priors
-        combined_depth_prior, combined_sparse_mask = self.combine_lidar_colmap_priors(
-            scaled_lidar_depth, confidence_map, colmap_depth_prior, colmap_sparse_mask, new_size
-        )
+        print(f"  LiDAR prior has {np.sum(lidar_sparse_mask)} valid pixels")
         
-        print(f"  Combined prior has {np.sum(combined_sparse_mask)} valid pixels")
-        print(f"    LiDAR contribution: {np.sum((combined_sparse_mask) & (~colmap_sparse_mask))}")
-        print(f"    COLMAP contribution: {np.sum(colmap_sparse_mask)}")
+        # Debug: Check depth value ranges
+        if np.any(lidar_sparse_mask):
+            valid_prior_depths = lidar_depth_prior[lidar_sparse_mask]
+            print(f"  Prior depth range: {valid_prior_depths.min():.3f} to {valid_prior_depths.max():.3f}")
+            print(f"  Prior depth mean: {valid_prior_depths.mean():.3f}")
         
-        # Complete depth using combined priors
+        # Complete depth using only LiDAR priors
         completed_depth = self.complete_depth_with_priors(
-            image_array, combined_depth_prior, combined_sparse_mask
+            image_array, lidar_depth_prior, lidar_sparse_mask
         )
+        
+        # Debug: Check completed depth value ranges
+        if np.any(completed_depth > 0):
+            valid_completed_depths = completed_depth[completed_depth > 0]
+            print(f"  Completed depth range: {valid_completed_depths.min():.3f} to {valid_completed_depths.max():.3f}")
+            print(f"  Completed depth mean: {valid_completed_depths.mean():.3f}")
+            print(f"  Completed valid pixels: {np.sum(completed_depth > 0)}")
+        else:
+            print(f"  WARNING: No valid completed depths!")
+        
+        # Debug: Check scaling consistency
+        print(f"  Image array shape: {image_array.shape}")
+        print(f"  LiDAR prior shape: {lidar_depth_prior.shape}")
+        print(f"  Completed depth shape: {completed_depth.shape}")
+        print(f"  Target size: {new_size}")
         
         # Generate point cloud from completed depth
         points_3d, colors = self.generate_point_cloud_from_completed_depth(
@@ -803,13 +918,50 @@ class LidarPointCloudGenerator:
         
         print(f"  Generated {len(points_3d)} 3D points from completed depth")
         
-        # Save individual point cloud
+        # Generate and save prior point cloud for debugging
+        prior_points_3d, prior_colors = self.generate_point_cloud_from_completed_depth(
+            image_array, lidar_depth_prior, scaled_K, camera_pose, pair['image_id']
+        )
+        
+        prior_output_path = self.get_individual_output_filename(
+            pair['depth_path'].name, "prior"
+        )
+        if len(prior_points_3d) > 0:
+            self.save_point_cloud(prior_points_3d, prior_colors, prior_output_path)
+            print(f"  Generated {len(prior_points_3d)} 3D points from prior")
+            print(f"  Saved prior point cloud: {prior_output_path}")
+            
+            # Debug: Compare prior point cloud bounds with simple LiDAR
+            if len(prior_points_3d) > 100:  # Only if we have enough points
+                prior_bounds = {
+                    'x_min': prior_points_3d[:, 0].min(), 'x_max': prior_points_3d[:, 0].max(),
+                    'y_min': prior_points_3d[:, 1].min(), 'y_max': prior_points_3d[:, 1].max(),
+                    'z_min': prior_points_3d[:, 2].min(), 'z_max': prior_points_3d[:, 2].max()
+                }
+                print(f"  Prior point cloud bounds:")
+                print(f"    X: {prior_bounds['x_min']:.3f} to {prior_bounds['x_max']:.3f}")
+                print(f"    Y: {prior_bounds['y_min']:.3f} to {prior_bounds['y_max']:.3f}")
+                print(f"    Z: {prior_bounds['z_min']:.3f} to {prior_bounds['z_max']:.3f}")
+        
+        # Save individual completed point cloud
         individual_output_path = self.get_individual_output_filename(
             pair['depth_path'].name, "completed"
         )
         if len(points_3d) > 0:
             self.save_point_cloud(points_3d, colors, individual_output_path)
             print(f"  Saved individual point cloud: {individual_output_path}")
+            
+            # Debug: Compare completed point cloud bounds with prior
+            if len(points_3d) > 100:  # Only if we have enough points
+                completed_bounds = {
+                    'x_min': points_3d[:, 0].min(), 'x_max': points_3d[:, 0].max(),
+                    'y_min': points_3d[:, 1].min(), 'y_max': points_3d[:, 1].max(),
+                    'z_min': points_3d[:, 2].min(), 'z_max': points_3d[:, 2].max()
+                }
+                print(f"  Completed point cloud bounds:")
+                print(f"    X: {completed_bounds['x_min']:.3f} to {completed_bounds['x_max']:.3f}")
+                print(f"    Y: {completed_bounds['y_min']:.3f} to {completed_bounds['y_max']:.3f}")
+                print(f"    Z: {completed_bounds['z_min']:.3f} to {completed_bounds['z_max']:.3f}")
         
         return points_3d, colors
     
@@ -1045,7 +1197,7 @@ class LidarPointCloudGenerator:
         print(f"Used global scale factor: {self.global_scale:.3f}")
         
         if self.args.enable_depth_completion:
-            print(f"Combined LiDAR depth and COLMAP priors for depth completion")
+            print(f"Used LiDAR-only priors for depth completion")
         else:
             print(f"Generated point clouds directly from registered LiDAR data")
 
