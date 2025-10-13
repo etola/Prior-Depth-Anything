@@ -1,0 +1,251 @@
+
+import numpy as np
+import open3d as o3d
+import matplotlib.cm as cm
+
+from PIL import Image
+
+
+def uvd_to_world_frame(uvd_map: np.ndarray, intrinsics: np.ndarray, pose: np.ndarray) -> np.ndarray:
+    """
+    Convert uvd map to world frame.
+    
+    Args:
+        depth_map: HxW numpy array
+        intrinsics: 3x3 numpy array
+        pose: 4x4 numpy array
+        uvd_map: HxWx3 array containing [u, v, depth] coordinates
+        
+    Returns:
+        xyz_map: HxWx3 array containing [x, y, z] world coordinates (0 for invalid points)
+    """
+    # Initialize output array
+    H, W = uvd_map.shape[:2]
+    xyz_map = np.zeros((H, W, 3), dtype=np.float32)
+    
+    # Extract valid points where depth > 0
+    valid_mask = uvd_map[:, :, 2] > 0
+    if not np.any(valid_mask):
+        return xyz_map
+    
+    # Get valid uvd coordinates
+    valid_u = uvd_map[valid_mask, 0]  # u coordinates
+    valid_v = uvd_map[valid_mask, 1]  # v coordinates
+    valid_d = uvd_map[valid_mask, 2]  # depth values
+    
+    # Extract intrinsic parameters
+    fx, fy = intrinsics[0, 0], intrinsics[1, 1]
+    cx, cy = intrinsics[0, 2], intrinsics[1, 2]
+    
+    # Convert to camera coordinates
+    x_cam = (valid_u - cx) * valid_d / fx
+    y_cam = (valid_v - cy) * valid_d / fy
+    z_cam = valid_d
+    
+    # Stack into homogeneous coordinates (Nx4)
+    cam_coords_homo = np.stack([x_cam, y_cam, z_cam, np.ones_like(x_cam)], axis=1)
+    
+    # Transform to world coordinates using inverse pose
+    # pose is cam_from_world, so we need world_from_cam = inv(cam_from_world)
+    world_from_cam = np.linalg.inv(pose)
+    world_coords = (world_from_cam @ cam_coords_homo.T).T[:, :3]  # (N, 3)
+    
+    # Put world coordinates back into the HxW grid
+    xyz_map[valid_mask] = world_coords
+    
+    return xyz_map
+
+
+def compute_depthmap(points_3d, intrinsics, cam_from_world, target_w, target_h):
+    """
+    Project 3D points to depth map in camera coordinate system.
+    
+    Args:
+        points_3d: (N, 3) array of 3D world coordinates
+        intrinsics: (3, 3) intrinsics matrix for a target_h x target_w image
+        cam_from_world (4, 4): camera pose: transformation matrix that maps world coordinates to camera coordinates when multiplied
+        target_w: target image width for depth map
+        target_h: target image height for depth map
+        
+    Returns:
+        depth_map: (target_h, target_w) numpy array with depth values
+    """
+    if len(points_3d) == 0:
+        return np.zeros((target_h, target_w), dtype=np.float32)
+    
+    # Convert 3D points to homogeneous coordinates
+    points_3d_homo = np.hstack([points_3d, np.ones((len(points_3d), 1))])
+    
+    # Transform to camera coordinates
+    cam_coords = (cam_from_world[:3, :] @ points_3d_homo.T).T
+    
+    # Extract depth values (z-coordinates in camera frame)
+    depths = cam_coords[:, 2]
+    
+    # Filter points behind camera
+    valid_mask = depths > 0
+    if not np.any(valid_mask):
+        return np.zeros((target_h, target_w), dtype=np.float32)
+    
+    cam_coords = cam_coords[valid_mask]
+    depths = depths[valid_mask]
+    
+    # Project to image coordinates
+    proj_coords = (intrinsics @ cam_coords.T).T
+    proj_coords = proj_coords / proj_coords[:, 2:3]  # Normalize by z
+    
+    # Convert to pixel coordinates
+    pixel_x = proj_coords[:, 0].astype(int)
+    pixel_y = proj_coords[:, 1].astype(int)
+    
+    # Filter points within image bounds
+    valid_pixels = (
+        (pixel_x >= 0) & (pixel_x < target_w) &
+        (pixel_y >= 0) & (pixel_y < target_h)
+    )
+    
+    depth_map = np.zeros((target_h, target_w), dtype=np.float32)
+    
+    if np.any(valid_pixels):
+        pixel_x = pixel_x[valid_pixels]
+        pixel_y = pixel_y[valid_pixels]
+        pixel_depths = depths[valid_pixels]
+        
+        # Handle multiple points per pixel by taking the closest depth
+        # Replace 0s with infinity so that any actual depth will be smaller
+        depth_map_working = np.where(depth_map == 0, np.inf, depth_map)
+        # Use minimum.at to handle multiple points mapping to same pixel
+        np.minimum.at(depth_map_working, (pixel_y, pixel_x), pixel_depths)
+        # Replace any remaining infinities with 0 (shouldn't happen given our data)
+        depth_map[:] = np.where(depth_map_working == np.inf, 0, depth_map_working)
+    
+    return depth_map
+
+
+
+def depthmap_to_camera_frame(depthmap: np.ndarray, intrinsics: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Convert depth image to a pointcloud in camera frame using numpy.
+
+    Args:
+        depthmap: HxW numpy array
+        intrinsics: 3x3 numpy array
+
+    Returns:
+        pointmap in camera frame (HxWx3 array), and a mask specifying valid pixels.
+    """
+    height, width = depthmap.shape
+    
+    # Create pixel coordinate grids
+    x_grid, y_grid = np.meshgrid(np.arange(width), np.arange(height), indexing='xy')
+    
+    # Extract intrinsics parameters
+    fx = intrinsics[0, 0]
+    fy = intrinsics[1, 1] 
+    cx = intrinsics[0, 2]
+    cy = intrinsics[1, 2]
+    
+    # Convert to 3D points in camera frame
+    depth_z = depthmap
+    xx = (x_grid - cx) * depth_z / fx
+    yy = (y_grid - cy) * depth_z / fy
+    pts3d_cam = np.stack([xx, yy, depth_z], axis=-1)
+
+    # Create valid mask for non-zero depth pixels
+    valid_mask = depthmap > 0.0
+
+    return pts3d_cam, valid_mask
+
+def depthmap_to_world_frame(depthmap: np.ndarray, intrinsics: np.ndarray, cam_from_world: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Convert depth image to a pointcloud in world frame using numpy.
+
+    Args:
+        depthmap: HxW numpy array
+        intrinsics: 3x3 numpy array
+        cam_from_world: 4x4 numpy array
+
+    Returns:
+        pointmap in world frame (HxWx3 array), and a mask specifying valid pixels.
+    """
+    # Get 3D points in camera frame
+    pts3d_cam, valid_mask = depthmap_to_camera_frame(depthmap, intrinsics)
+    
+    # Convert points from camera frame to world frame
+    height, width = depthmap.shape
+    
+    # Convert to homogeneous coordinates
+    pts3d_cam_homo = np.concatenate([
+        pts3d_cam, 
+        np.ones((height, width, 1))
+    ], axis=-1)
+
+    cam_to_world = np.linalg.inv(cam_from_world)
+
+    # Transform to world coordinates: pts_world = cam_to_world @ pts_cam_homo
+    # Reshape for matrix multiplication: (H*W, 4) @ (4, 4) -> (H*W, 4)
+    pts3d_cam_homo_flat = pts3d_cam_homo.reshape(-1, 4)
+    pts3d_world_homo_flat = pts3d_cam_homo_flat @ cam_to_world.T
+    
+    # Reshape back and take only xyz coordinates
+    pts3d_world = pts3d_world_homo_flat[:, :3].reshape(height, width, 3)
+    
+    return pts3d_world, valid_mask
+
+def colorize_heatmap(data_map, colormap='plasma', data_range=None):
+    """
+    Colorize a data map (depth, confidence, etc.) for visualization and optionally save it.
+    
+    Args:
+        data_map / confidence_map: (H, W) numpy array with data values
+        colormap: matplotlib colormap name (default: 'plasma')
+        data_range: optional tuple (min_value, max_value) for consistent scaling across multiple maps        
+    Returns:
+        colorized_image: (H, W, 3) RGB array of colorized data map
+    """
+    # Handle case where data map is all zeros
+    if np.max(data_map) == 0:
+        # Create a black image for zero values
+        colorized = np.zeros((data_map.shape[0], data_map.shape[1], 3), dtype=np.uint8)
+        return colorized
+    
+    # Determine data range for normalization
+    valid_mask = data_map > 0
+
+    # Create normalized data map
+    normalized_data = np.zeros_like(data_map, dtype=np.float32)
+
+    if np.any(valid_mask):
+        if data_range is not None:
+            min_value, max_value = data_range
+        else:
+            min_value = np.min(data_map[valid_mask])
+            max_value = np.max(data_map[valid_mask])
+        if max_value > min_value:
+            normalized_data[valid_mask] = np.clip((data_map[valid_mask].astype(np.float32) - min_value) / (max_value - min_value), 0, 1)
+        else:
+            normalized_data[valid_mask] = 1.0
+    
+    # Apply colormap
+    cmap = cm.get_cmap(colormap)
+    colorized = cmap(normalized_data)
+
+    # Set invalid pixels to black
+    colorized[~valid_mask] = [0, 0, 0, 1]
+    
+    # Convert to 8-bit RGB
+    colorized_rgb = (colorized[:, :, :3] * 255).astype(np.uint8)
+
+    return colorized_rgb
+
+def save_point_cloud(pts, colors, save_path):
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(pts)
+    pcd.colors = o3d.utility.Vector3dVector(colors)
+    o3d.io.write_point_cloud(save_path, pcd)
+
+def subsample_point_cloud(pts, colors, num_points):
+    if len(pts) < num_points:
+        return pts, colors
+    indices = np.random.choice(len(pts), num_points, replace=False)
+    return pts[indices], colors[indices]
