@@ -78,7 +78,7 @@ if __name__ == '__main__':
         images = load_and_preprocess_images(image_names).to(device)
 
         # Predict attributes including cameras, depth maps, and point maps.
-        with torch.cuda.amp.autocast(dtype=dtype):
+        with torch.amp.autocast(device_type='cuda', dtype=dtype):
             predictions = vggt(images)
             
         ########## Refine stage.
