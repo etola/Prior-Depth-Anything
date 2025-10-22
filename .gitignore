@@ -1,6 +1,7 @@
 eval/
 prior_depth_anything.egg-info/
 output/
+__pycache__/
 
 *.png
 *.jpg
